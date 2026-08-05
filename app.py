@@ -19,6 +19,8 @@ HUGGINGFACE_EMBEDDING_MODEL = os.getenv(
 EXPECTED_EMBEDDING_DIMENSION = int(os.getenv("EXPECTED_EMBEDDING_DIMENSION", "384"))
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "pdf_documents")
 VECTOR_FUNCTION = os.getenv("SUPABASE_VECTOR_FUNCTION", "match_pdf_documents")
+SUPABASE_METADATA_COLUMN = os.getenv("SUPABASE_METADATA_COLUMN", "metadata")
+SUPABASE_USE_METADATA = os.getenv("SUPABASE_USE_METADATA", "false").lower() in ("1", "true", "yes")
 
 app = FastAPI(title="Aksaraku Python API")
 app.add_middleware(
@@ -47,11 +49,19 @@ def embed_text(text: str) -> List[float]:
             detail="No Hugging Face API key configured. Set HUGGINGFACE_API_KEY.",
         )
 
+    result = None
     try:
-        result = hf_client.feature_extraction(text)
-    except AttributeError:
-        # newer `InferenceClient` may provide `embeddings(model=..., inputs=...)`
-        result = hf_client.embeddings(model=HUGGINGFACE_EMBEDDING_MODEL, inputs=text)
+        result = hf_client.feature_extraction(text, model=HUGGINGFACE_EMBEDDING_MODEL)
+    except Exception as e:
+        detail = (
+            f"Hugging Face request failed. Error: {e}. "
+            f"Ensure `HUGGINGFACE_EMBEDDING_MODEL` is an embedding-capable model, "
+            f"e.g. 'sentence-transformers/all-MiniLM-L6-v2'."
+        )
+        raise HTTPException(status_code=500, detail=detail)
+
+    if hasattr(result, "tolist"):
+        result = result.tolist()
 
     # Normalize possible response shapes into a single embedding list
     embedding = None
@@ -69,7 +79,10 @@ def embed_text(text: str) -> List[float]:
     if not isinstance(embedding, list):
         raise HTTPException(
             status_code=500,
-            detail=f"Hugging Face response invalid: {result}",
+            detail=(
+                f"Hugging Face response invalid: {result}. Ensure `HUGGINGFACE_EMBEDDING_MODEL` "
+                f"is an embedding model such as 'sentence-transformers/all-MiniLM-L6-v2'."
+            ),
         )
     if not validate_embedding(embedding):
         raise HTTPException(
@@ -98,10 +111,50 @@ def normalize_chunk(chunk: Dict[str, Any]) -> Dict[str, Any]:
     if embedding is not None:
         row["embedding"] = embedding
 
-    if "metadata" in chunk:
-        row["metadata"] = chunk.get("metadata")
+    if SUPABASE_USE_METADATA and "metadata" in chunk:
+        row[SUPABASE_METADATA_COLUMN] = chunk.get("metadata")
 
     return row
+
+
+def _extract_response_parts(response: Any) -> Dict[str, Any]:
+    """Safely extract `error` and `data` from various Supabase client response shapes."""
+    # dict-like responses
+    if isinstance(response, dict):
+        return {"error": response.get("error"), "data": response.get("data")}
+
+    error = None
+    data = None
+    try:
+        error = getattr(response, "error", None)
+    except Exception:
+        error = None
+
+    try:
+        data = getattr(response, "data", None)
+    except Exception:
+        data = None
+
+    # fallback keys sometimes used
+    if error is None:
+        try:
+            error = getattr(response, "errors", None)
+        except Exception:
+            error = None
+
+    if data is None:
+        # some clients return `body` or `output`
+        try:
+            data = getattr(response, "body", None)
+        except Exception:
+            data = None
+        if data is None:
+            try:
+                data = getattr(response, "output", None)
+            except Exception:
+                data = None
+
+    return {"error": error, "data": data}
 
 
 class ChunkModel(BaseModel):
@@ -132,10 +185,11 @@ async def embed_upsert(body: EmbedUpsertRequest):
         rows.append(row)
 
     response = supabase.table(SUPABASE_TABLE).insert(rows).select("*").execute()
-    if response.error:
-        raise HTTPException(status_code=500, detail=str(response.error))
+    parts = _extract_response_parts(response)
+    if parts.get("error"):
+        raise HTTPException(status_code=500, detail=str(parts.get("error")))
 
-    return {"data": response.data}
+    return {"data": parts.get("data")}
 
 
 @app.post("/embed-upsert-raw")
@@ -154,10 +208,11 @@ async def embed_upsert_raw(body: EmbedUpsertRequest):
         rows.append(row)
 
     response = supabase.table(SUPABASE_TABLE).insert(rows).select("*").execute()
-    if response.error:
-        raise HTTPException(status_code=500, detail=str(response.error))
+    parts = _extract_response_parts(response)
+    if parts.get("error"):
+        raise HTTPException(status_code=500, detail=str(parts.get("error")))
 
-    return {"data": response.data}
+    return {"data": parts.get("data")}
 
 
 @app.post("/query-docs")
@@ -175,8 +230,8 @@ async def query_docs(body: QueryRequest):
             "match_count": 4,
         },
     ).execute()
+    parts = _extract_response_parts(response)
+    if parts.get("error"):
+        raise HTTPException(status_code=500, detail=str(parts.get("error")))
 
-    if response.error:
-        raise HTTPException(status_code=500, detail=str(response.error))
-
-    return {"data": response.data or []}
+    return {"data": parts.get("data") or []}
