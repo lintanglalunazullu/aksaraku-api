@@ -36,6 +36,13 @@ GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.1-8b-instant")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "openrouter/free")
 
+# TOKEN / CONTEXT OPTIMIZATION
+MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "3500"))
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "2600"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "500"))
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+COMPRESS_CONTEXT = os.getenv("COMPRESS_CONTEXT", "true").lower() in ("1", "true", "yes")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -337,7 +344,7 @@ def _call_openai_compatible_chat(client: OpenAI, model: str, prompt: str) -> str
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
-        max_tokens=512,
+        max_tokens=MAX_OUTPUT_TOKENS,
     )
     answer = _extract_openai_chat_text(response)
     if not answer:
@@ -492,42 +499,153 @@ async def query_docs(body: QueryRequest):
     return {"data": parts.get("data") or []}
 
 
+# =========================
+# CONTEXT COMPRESSION
+# =========================
+
+def estimate_tokens(text: str) -> int:
+    """Fast token estimate for budgeting; provider usage remains authoritative."""
+    return max(1, (len(text) + 3) // 4) if text else 0
+
+
+def _words(text: str) -> set[str]:
+    import re
+    return set(re.findall(r"[a-zA-Z0-9À-ÿ]+", text.lower()))
+
+
+def _sentences(text: str) -> List[str]:
+    import re
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def compress_context(question: str, docs: List[Dict[str, Any]], max_tokens: int) -> tuple[str, Dict[str, Any]]:
+    """Free deterministic compression: rank sentences by query overlap + vector score."""
+    if not docs:
+        return "", {"original_tokens": 0, "compressed_tokens": 0, "compression_ratio": 0.0, "sentences_kept": 0}
+
+    qwords = _words(question)
+    candidates=[]
+    original=[]
+    for di,d in enumerate(docs):
+        pdf=d.get("pdf_name") or "Sumber tidak diketahui"
+        content=str(d.get("content") or d.get("text") or "").strip()
+        ak=d.get("akurasi")
+        if ak is None: ak=d.get("accuracy")
+        if ak is None: ak=d.get("akurasi_data")
+        score=float(d.get("similarity") or d.get("score") or d.get("similarity_score") or 0.0)
+        header=f"File: {pdf}" + (f" | Akurasi: {ak}" if ak is not None else "")
+        original.append(header+"\n"+content)
+        for si,s in enumerate(_sentences(content)):
+            sw=_words(s)
+            overlap=len(sw & qwords)/max(1,len(qwords))
+            relevance=overlap*0.7 + max(0.0,min(score,1.0))*0.3 + (0.03 if si==0 else 0)
+            candidates.append({"di":di,"si":si,"pdf":pdf,"ak":ak,"s":s,"score":relevance})
+
+    original_text="\n\n---\n\n".join(original)
+    original_tokens=estimate_tokens(original_text)
+    if not COMPRESS_CONTEXT or original_tokens <= max_tokens:
+        return original_text,{"original_tokens":original_tokens,"compressed_tokens":original_tokens,"compression_ratio":1.0,"sentences_kept":len(candidates),"compressed":False}
+
+    by_doc={}
+    for c in candidates: by_doc.setdefault(c["di"],[]).append(c)
+    selected=[]
+    selected_ids=set()
+    for di in range(len(docs)):
+        arr=sorted(by_doc.get(di,[]),key=lambda x:x["score"],reverse=True)
+        if arr:
+            selected.append(arr[0]); selected_ids.add(id(arr[0]))
+
+    ranked=sorted(candidates,key=lambda x:x["score"],reverse=True)
+    def render(items):
+        grouped={}
+        for c in items: grouped.setdefault(c["di"],[]).append(c)
+        blocks=[]
+        for di in sorted(grouped):
+            arr=sorted(grouped[di],key=lambda x:x["si"])
+            header=f"File: {arr[0]['pdf']}" + (f" | Akurasi: {arr[0]['ak']}" if arr[0]["ak"] is not None else "")
+            blocks.append(header+"\n"+" ".join(x["s"] for x in arr))
+        return "\n\n---\n\n".join(blocks)
+
+    for c in ranked:
+        if id(c) in selected_ids: continue
+        trial=selected+[c]
+        if estimate_tokens(render(trial)) <= max_tokens:
+            selected.append(c); selected_ids.add(id(c))
+
+    compressed=render(selected)
+    max_chars=max_tokens*4
+    if len(compressed)>max_chars:
+        compressed=compressed[:max_chars].rsplit(" ",1)[0]+"…"
+    ct=estimate_tokens(compressed)
+    return compressed,{"original_tokens":original_tokens,"compressed_tokens":ct,"compression_ratio":round(ct/max(1,original_tokens),4),"sentences_kept":len(selected),"compressed":True}
+
+
+def _usage(response: Any) -> Dict[str, Optional[int]]:
+    u=getattr(response,"usage",None)
+    if u is None: return {"prompt_tokens":None,"completion_tokens":None,"total_tokens":None}
+    def g(n):
+        try:
+            v=getattr(u,n,None); return int(v) if v is not None else None
+        except Exception: return None
+    return {"prompt_tokens":g("prompt_tokens"),"completion_tokens":g("completion_tokens"),"total_tokens":g("total_tokens")}
+
+
+def generate_with_fallback_with_usage(prompt: str) -> tuple[str,str,Dict[str,Optional[int]]]:
+    errors=[]
+    for name,client,model in [("groq",groq_client,GROQ_CHAT_MODEL),("openrouter",openrouter_client,OPENROUTER_CHAT_MODEL)]:
+        if client is None:
+            errors.append(f"{name}: API key/client not configured"); continue
+        try:
+            response=client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role":"system","content":"Kamu adalah asisten RAG untuk Aksaraku. Jawab dalam Bahasa Indonesia. Gunakan hanya informasi dari konteks dokumen. Jika informasi tidak ditemukan, katakan tidak ditemukan. Jangan mengarang fakta atau sumber."},
+                    {"role":"user","content":prompt},
+                ],
+                temperature=0.2,
+                max_tokens=MAX_OUTPUT_TOKENS,
+            )
+            answer=_extract_openai_chat_text(response)
+            if not answer: raise RuntimeError(f"{model} returned an empty response")
+            return answer,name,_usage(response)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}"); logger.warning("LLM provider %s failed: %s",name,exc)
+    raise RuntimeError("All LLM providers failed. " + " | ".join(errors))
+
+
 @app.post("/chat")
 async def chat(body: QueryRequest):
-    question = body.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="question is required")
-
-    # embed the question
-    query_embedding = embed_text(question)
-
-    # fetch similar documents (tries RPC first, falls back to client-side)
-    docs = get_similar_documents(query_embedding, top_k=4)
-
-    # Build context including akurasi field if present
-    context_parts: List[str] = []
-    for d in docs:
-        pdf_name = d.get("pdf_name") or d.get("pdf_name")
-        content = d.get("content") or d.get("text") or ""
-        akurasi = d.get("akurasi") or d.get("accuracy") or d.get("akurasi_data") or None
-        header = f"File: {pdf_name} | Akurasi: {akurasi}\n" if pdf_name else (f"Akurasi: {akurasi}\n" if akurasi is not None else "")
-        context_parts.append(header + content[:2000])
-
-    context_text = "\n\n---\n\n".join(context_parts) if context_parts else ""
-
-    system_instruction = (
+    question=body.question.strip()
+    if not question: raise HTTPException(status_code=400,detail="question is required")
+    query_embedding=embed_text(question)
+    docs=get_similar_documents(query_embedding,top_k=RAG_TOP_K)
+    context_text,compression=compress_context(question,docs,MAX_CONTEXT_TOKENS)
+    system_instruction=(
         "Kamu asisten yang menjawab dalam Bahasa Indonesia. "
-        "Gunakan hanya informasi dari dokumen yang diberikan di bawah ini. "
-        "Jika menjawab, cantumkan sumber dari nama file PDF dan sertakan nilai 'akurasi' bila tersedia. "
+        "Gunakan hanya informasi dari dokumen yang diberikan. "
+        "Cantumkan sumber dari nama file PDF dan nilai akurasi bila tersedia. "
         "Jika informasi tidak ada di dokumen, jelaskan bahwa tidak ditemukan di dokumen."
     )
-
-    prompt = f"{system_instruction}\n\nDOKUMEN:\n{context_text}\n\nPERTANYAAN: {question}\n\nJAWAB:"
-
+    prompt=f"{system_instruction}\n\nDOKUMEN RELEVAN:\n{context_text}\n\nPERTANYAAN: {question}\n\nJAWAB:"
+    estimated_input=estimate_tokens(prompt)
     try:
-        answer_text, provider = generate_with_fallback(prompt)
+        answer,provider,usage=generate_with_fallback_with_usage(prompt)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"All LLM providers failed: {e}")
-
-    # Return answer with sources and provider used.
-    return {"answer": answer_text, "provider": provider, "sources": docs}
+        raise HTTPException(status_code=502,detail=f"All LLM providers failed: {e}")
+    return {
+        "answer":answer,
+        "provider":provider,
+        "sources":docs,
+        "token_optimization":{
+            "enabled":COMPRESS_CONTEXT,
+            "estimated_input_tokens":estimated_input,
+            "context_original_tokens":compression["original_tokens"],
+            "context_compressed_tokens":compression["compressed_tokens"],
+            "compression_ratio":compression["compression_ratio"],
+            "sentences_kept":compression["sentences_kept"],
+            "max_context_tokens":MAX_CONTEXT_TOKENS,
+            "max_output_tokens":MAX_OUTPUT_TOKENS,
+            "provider_usage":usage,
+        },
+    }
