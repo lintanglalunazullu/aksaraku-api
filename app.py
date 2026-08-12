@@ -8,6 +8,7 @@ from huggingface_hub import InferenceClient
 import json
 import math
 import inspect
+from openai import OpenAI
 import logging
 from numbers import Number
 from typing import Sequence
@@ -29,7 +30,11 @@ SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "pdf_documents")
 VECTOR_FUNCTION = os.getenv("SUPABASE_VECTOR_FUNCTION", "match_pdf_documents")
 SUPABASE_METADATA_COLUMN = os.getenv("SUPABASE_METADATA_COLUMN", "metadata")
 SUPABASE_USE_METADATA = os.getenv("SUPABASE_USE_METADATA", "false").lower() in ("1", "true", "yes")
-HUGGINGFACE_CHAT_MODEL = os.getenv("HUGGINGFACE_CHAT_MODEL", "Qwen/Qwen3-8B")
+# LLM providers: Groq first, OpenRouter second.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.1-8b-instant")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "openrouter/free")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,6 +49,28 @@ app.add_middleware(
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 hf_client = InferenceClient(token=HUGGINGFACE_API_KEY) if HUGGINGFACE_API_KEY else None
+
+groq_client = (
+    OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+    )
+    if GROQ_API_KEY
+    else None
+)
+
+openrouter_client = (
+    OpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+        default_headers={
+            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost:3000"),
+            "X-Title": os.getenv("OPENROUTER_SITE_NAME", "Aksaraku"),
+        },
+    )
+    if OPENROUTER_API_KEY
+    else None
+)
 
 
 def _is_numeric(value: Any) -> bool:
@@ -285,138 +312,71 @@ def _parse_embedding(raw: Any) -> Optional[List[float]]:
     return None
 
 
-def _call_hf_generation_method(func: Any, prompt: str, gen_params: Dict[str, Any]) -> Any:
-    sig = None
+def _extract_openai_chat_text(response: Any) -> str:
+    """Extract assistant text from an OpenAI-compatible chat response."""
     try:
-        sig = inspect.signature(func)
+        content = response.choices[0].message.content
+        return content.strip() if isinstance(content, str) else ""
     except Exception:
-        sig = None
-
-    kwargs: Dict[str, Any] = {}
-    if sig:
-        if "inputs" in sig.parameters:
-            kwargs["inputs"] = prompt
-        elif "input" in sig.parameters:
-            kwargs["input"] = prompt
-        elif "prompt" in sig.parameters:
-            kwargs["prompt"] = prompt
-
-        if "model" in sig.parameters:
-            kwargs["model"] = HUGGINGFACE_CHAT_MODEL
-        elif "model_id" in sig.parameters:
-            kwargs["model_id"] = HUGGINGFACE_CHAT_MODEL
-
-        for k, v in gen_params.items():
-            if k in sig.parameters:
-                kwargs[k] = v
-
-    if kwargs:
-        try:
-            return func(**kwargs)
-        except TypeError:
-            pass
-
-    try:
-        return func(prompt)
-    except Exception:
-        pass
-
-    try:
-        return func(prompt, HUGGINGFACE_CHAT_MODEL)
-    except Exception:
-        pass
-
-    try:
-        return func(HUGGINGFACE_CHAT_MODEL, prompt)
-    except Exception as final_err:
-        raise final_err
+        return ""
 
 
-def _call_hf_chat_completion(prompt: str) -> Any:
-    """Call Hugging Face's current OpenAI-compatible chat-completions API."""
-    if not hf_client:
-        raise RuntimeError("Hugging Face client not configured")
-
-    chat_api = getattr(hf_client, "chat", None)
-    completions_api = getattr(chat_api, "completions", None) if chat_api else None
-    create = getattr(completions_api, "create", None) if completions_api else None
-
-    if not callable(create):
-        raise RuntimeError(
-            "This huggingface_hub version does not expose "
-            "InferenceClient.chat.completions.create(). "
-            "Please update huggingface_hub to a current version."
-        )
-
-    response = create(
-        model=HUGGINGFACE_CHAT_MODEL,
+def _call_openai_compatible_chat(client: OpenAI, model: str, prompt: str) -> str:
+    response = client.chat.completions.create(
+        model=model,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Kamu adalah asisten yang menjawab dalam Bahasa Indonesia. "
-                    "Jawab berdasarkan konteks yang diberikan oleh pengguna."
+                    "Kamu adalah asisten RAG untuk Aksaraku. Jawab dalam Bahasa Indonesia. "
+                    "Gunakan hanya informasi dari konteks dokumen yang diberikan. "
+                    "Jika informasi tidak ada di konteks, katakan bahwa informasi tidak ditemukan. "
+                    "Jangan mengarang sumber atau fakta."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
+        temperature=0.2,
         max_tokens=512,
     )
-    return response
+    answer = _extract_openai_chat_text(response)
+    if not answer:
+        raise RuntimeError(f"{model} returned an empty response")
+    return answer
 
 
-def hf_generate(prompt: str) -> Any:
-    """Generate a chat response through Hugging Face Chat Completions.
-
-    Chat models/providers such as Nscale may expose the conversational task
-    but reject the legacy text-generation task. Therefore this endpoint uses
-    the chat-completions API directly instead of trying text_generation first.
-    """
-    return _call_hf_chat_completion(prompt)
+def groq_generate(prompt: str) -> str:
+    if not groq_client:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+    return _call_openai_compatible_chat(groq_client, GROQ_CHAT_MODEL, prompt)
 
 
-def _extract_chat_text(response: Any) -> str:
-    """Extract assistant text from an HF chat-completions response."""
-    if response is None:
-        return ""
+def openrouter_generate(prompt: str) -> str:
+    if not openrouter_client:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
+    return _call_openai_compatible_chat(openrouter_client, OPENROUTER_CHAT_MODEL, prompt)
 
-    # OpenAI-compatible object response:
-    # response.choices[0].message.content
-    choices = getattr(response, "choices", None)
-    if choices:
-        first = choices[0]
-        message = getattr(first, "message", None)
-        if message is not None:
-            content = getattr(message, "content", None)
-            if isinstance(content, str):
-                return content.strip()
 
-        # Some compatible responses expose text directly.
-        text = getattr(first, "text", None)
-        if isinstance(text, str):
-            return text.strip()
+def generate_with_fallback(prompt: str) -> tuple[str, str]:
+    """Try Groq first, then OpenRouter. Returns (answer, provider)."""
+    errors: List[str] = []
 
-    # Dict fallback for providers/versions returning plain dictionaries.
-    if isinstance(response, dict):
-        choices = response.get("choices")
-        if isinstance(choices, list) and choices:
-            first = choices[0]
-            if isinstance(first, dict):
-                message = first.get("message")
-                if isinstance(message, dict):
-                    content = message.get("content")
-                    if isinstance(content, str):
-                        return content.strip()
-                text = first.get("text")
-                if isinstance(text, str):
-                    return text.strip()
+    providers = [
+        ("groq", groq_generate),
+        ("openrouter", openrouter_generate),
+    ]
 
-        for key in ("generated_text", "text", "content"):
-            value = response.get(key)
-            if isinstance(value, str):
-                return value.strip()
+    for name, generator in providers:
+        try:
+            answer = generator(prompt)
+            logger.info("LLM response provider=%s model=%s", name,
+                        GROQ_CHAT_MODEL if name == "groq" else OPENROUTER_CHAT_MODEL)
+            return answer, name
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+            logger.warning("LLM provider %s failed: %s", name, exc)
 
-    return ""
+    raise RuntimeError("All LLM providers failed. " + " | ".join(errors))
 
 
 def get_similar_documents(query_embedding: List[float], top_k: int = 4) -> List[Dict[str, Any]]:
@@ -564,22 +524,10 @@ async def chat(body: QueryRequest):
 
     prompt = f"{system_instruction}\n\nDOKUMEN:\n{context_text}\n\nPERTANYAAN: {question}\n\nJAWAB:"
 
-    if not hf_client:
-        raise HTTPException(status_code=500, detail="Hugging Face API key not configured for chat generation.")
-
     try:
-        gen = hf_generate(prompt)
+        answer_text, provider = generate_with_fallback(prompt)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Hugging Face generation error: {e}")
+        raise HTTPException(status_code=502, detail=f"All LLM providers failed: {e}")
 
-    # Extract text from the OpenAI-compatible HF chat response.
-    answer_text = _extract_chat_text(gen)
-
-    if not answer_text:
-        raise HTTPException(
-            status_code=502,
-            detail="Hugging Face returned an empty chat response."
-        )
-
-    # return answer with sources and raw docs
-    return {"answer": answer_text, "sources": docs}
+    # Return answer with sources and provider used.
+    return {"answer": answer_text, "provider": provider, "sources": docs}
