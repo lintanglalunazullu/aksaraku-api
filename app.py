@@ -361,11 +361,27 @@ def _extract_openai_chat_text(response: Any) -> str:
 
 
 def _public_sources(documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Return source metadata without exposing large embedding vectors."""
+    """Return source metadata without exposing vectors or ranking metrics."""
+    hidden_fields = {
+        "embedding", "embbbed", "embeddings", "akurasi", "accuracy",
+        "akurasi_data", "similarity", "score", "similarity_score", "confidence",
+        "confidence_score",
+    }
     return [
-        {key: value for key, value in document.items() if key not in {"embedding", "embbbed", "embeddings"}}
+        {key: value for key, value in document.items() if key not in hidden_fields}
         for document in documents
     ]
+
+
+def _clean_answer(answer: str) -> str:
+    """Remove the legacy accuracy disclaimer without changing other answer text."""
+    import re
+
+    pattern = re.compile(
+        r"\s*\*{0,2}Tidak ada nilai akurasi yang tersedia dalam dokumen\.\*{0,2}\s*",
+        re.IGNORECASE,
+    )
+    return pattern.sub(" ", answer).strip()
 
 
 def _call_openai_compatible_chat(client: OpenAI, model: str, prompt: str) -> str:
@@ -378,7 +394,9 @@ def _call_openai_compatible_chat(client: OpenAI, model: str, prompt: str) -> str
                     "Kamu adalah asisten RAG untuk Aksaraku. Jawab dalam Bahasa Indonesia. "
                     "Gunakan hanya informasi dari konteks dokumen yang diberikan. "
                     "Jika informasi tidak ada di konteks, katakan bahwa informasi tidak ditemukan. "
-                    "Jangan mengarang sumber atau fakta."
+                    "Jangan mengarang sumber atau fakta. Jangan menampilkan nilai akurasi, "
+                    "similarity score, confidence score, atau menyebut bahwa nilai tersebut tidak tersedia. "
+                    "Jangan membuat kalimat pengganti terkait akurasi."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -570,17 +588,14 @@ def compress_context(question: str, docs: List[Dict[str, Any]], max_tokens: int)
     for di,d in enumerate(docs):
         pdf=d.get("pdf_name") or "Sumber tidak diketahui"
         content=str(d.get("content") or d.get("text") or "").strip()
-        ak=d.get("akurasi")
-        if ak is None: ak=d.get("accuracy")
-        if ak is None: ak=d.get("akurasi_data")
         score=float(d.get("similarity") or d.get("score") or d.get("similarity_score") or 0.0)
-        header=f"File: {pdf}" + (f" | Akurasi: {ak}" if ak is not None else "")
+        header=f"File: {pdf}"
         original.append(header+"\n"+content)
         for si,s in enumerate(_sentences(content)):
             sw=_words(s)
             overlap=len(sw & qwords)/max(1,len(qwords))
             relevance=overlap*0.7 + max(0.0,min(score,1.0))*0.3 + (0.03 if si==0 else 0)
-            candidates.append({"di":di,"si":si,"pdf":pdf,"ak":ak,"s":s,"score":relevance})
+            candidates.append({"di":di,"si":si,"pdf":pdf,"s":s,"score":relevance})
 
     original_text="\n\n---\n\n".join(original)
     original_tokens=estimate_tokens(original_text)
@@ -603,7 +618,7 @@ def compress_context(question: str, docs: List[Dict[str, Any]], max_tokens: int)
         blocks=[]
         for di in sorted(grouped):
             arr=sorted(grouped[di],key=lambda x:x["si"])
-            header=f"File: {arr[0]['pdf']}" + (f" | Akurasi: {arr[0]['ak']}" if arr[0]["ak"] is not None else "")
+            header=f"File: {arr[0]['pdf']}"
             blocks.append(header+"\n"+" ".join(x["s"] for x in arr))
         return "\n\n---\n\n".join(blocks)
 
@@ -645,7 +660,7 @@ def generate_with_fallback_with_usage(prompt: str) -> tuple[str,str,Dict[str,Opt
             response=client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role":"system","content":"Kamu adalah asisten RAG untuk Aksaraku. Jawab dalam Bahasa Indonesia. Gunakan hanya informasi dari konteks dokumen. Jika informasi tidak ditemukan, katakan tidak ditemukan. Jangan mengarang fakta atau sumber."},
+                    {"role":"system","content":"Kamu adalah asisten RAG untuk Aksaraku. Jawab dalam Bahasa Indonesia. Gunakan hanya informasi dari konteks dokumen. Jika informasi tidak ditemukan, katakan tidak ditemukan. Jangan mengarang fakta atau sumber. Jangan menampilkan nilai akurasi, similarity score, confidence score, atau menyebut bahwa nilai tersebut tidak tersedia. Jangan membuat kalimat pengganti terkait akurasi."},
                     {"role":"user","content":prompt},
                 ],
                 temperature=0.2,
@@ -669,13 +684,17 @@ async def chat(body: QueryRequest):
     system_instruction=(
         "Kamu asisten yang menjawab dalam Bahasa Indonesia. "
         "Gunakan hanya informasi dari dokumen yang diberikan. "
-        "Cantumkan sumber dari nama file PDF dan nilai akurasi bila tersedia. "
+        "Gunakan nama file PDF sebagai sumber bila relevan. "
+        "Jangan menampilkan nilai akurasi, similarity score, confidence score, "
+        "atau menyebut bahwa nilai tersebut tidak tersedia. "
+        "Jangan membuat kalimat pengganti terkait akurasi. "
         "Jika informasi tidak ada di dokumen, jelaskan bahwa tidak ditemukan di dokumen."
     )
     prompt=f"{system_instruction}\n\nDOKUMEN RELEVAN:\n{context_text}\n\nPERTANYAAN: {question}\n\nJAWAB:"
     estimated_input=estimate_tokens(prompt)
     try:
         answer,provider,usage=generate_with_fallback_with_usage(prompt)
+        answer=_clean_answer(answer)
     except Exception as e:
         raise HTTPException(status_code=502,detail=f"All LLM providers failed: {e}")
     return {
