@@ -32,9 +32,19 @@ SUPABASE_METADATA_COLUMN = os.getenv("SUPABASE_METADATA_COLUMN", "metadata")
 SUPABASE_USE_METADATA = os.getenv("SUPABASE_USE_METADATA", "false").lower() in ("1", "true", "yes")
 # LLM providers: Groq first, OpenRouter second.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.1-8b-instant")
+GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "openrouter/free")
+GROQ_MODEL_CANDIDATES = (
+    GROQ_CHAT_MODEL,
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+)
+OPENROUTER_MODEL_CANDIDATES = (
+    OPENROUTER_CHAT_MODEL,
+    "openrouter/free",
+)
 
 # TOKEN / CONTEXT OPTIMIZATION
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "3500"))
@@ -78,6 +88,19 @@ openrouter_client = (
     if OPENROUTER_API_KEY
     else None
 )
+
+
+def _find_available_model(client: OpenAI, candidates: tuple[str, ...]) -> str:
+    """Return the first configured model that the provider currently exposes."""
+    try:
+        available = {model.id for model in client.models.list().data}
+        for candidate in candidates:
+            if candidate in available:
+                return candidate
+        raise RuntimeError("No configured model is available")
+    except Exception as exc:
+        logger.warning("Could not verify provider models: %s", exc)
+        return candidates[0]
 
 
 def _is_numeric(value: Any) -> bool:
@@ -323,9 +346,26 @@ def _extract_openai_chat_text(response: Any) -> str:
     """Extract assistant text from an OpenAI-compatible chat response."""
     try:
         content = response.choices[0].message.content
-        return content.strip() if isinstance(content, str) else ""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = [
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            ]
+            return "".join(parts).strip()
+        return ""
     except Exception:
         return ""
+
+
+def _public_sources(documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return source metadata without exposing large embedding vectors."""
+    return [
+        {key: value for key, value in document.items() if key not in {"embedding", "embbbed", "embeddings"}}
+        for document in documents
+    ]
 
 
 def _call_openai_compatible_chat(client: OpenAI, model: str, prompt: str) -> str:
@@ -593,9 +633,14 @@ def _usage(response: Any) -> Dict[str, Optional[int]]:
 
 def generate_with_fallback_with_usage(prompt: str) -> tuple[str,str,Dict[str,Optional[int]]]:
     errors=[]
-    for name,client,model in [("groq",groq_client,GROQ_CHAT_MODEL),("openrouter",openrouter_client,OPENROUTER_CHAT_MODEL)]:
+    providers = [
+        ("groq", groq_client, GROQ_MODEL_CANDIDATES),
+        ("openrouter", openrouter_client, OPENROUTER_MODEL_CANDIDATES),
+    ]
+    for name, client, candidates in providers:
         if client is None:
             errors.append(f"{name}: API key/client not configured"); continue
+        model = _find_available_model(client, candidates)
         try:
             response=client.chat.completions.create(
                 model=model,
@@ -636,7 +681,7 @@ async def chat(body: QueryRequest):
     return {
         "answer":answer,
         "provider":provider,
-        "sources":docs,
+        "sources":_public_sources(docs),
         "token_optimization":{
             "enabled":COMPRESS_CONTEXT,
             "estimated_input_tokens":estimated_input,

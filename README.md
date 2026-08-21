@@ -53,6 +53,10 @@ uvicorn app:app --host 0.0.0.0 --port 3000 --reload
 - `EXPECTED_EMBEDDING_DIMENSION`
 - `SUPABASE_TABLE`
 - `SUPABASE_VECTOR_FUNCTION`
+- `GROQ_API_KEY`
+- `GROQ_CHAT_MODEL` (default: `llama-3.3-70b-versatile`)
+- `OPENROUTER_API_KEY`
+- `OPENROUTER_CHAT_MODEL` (default: `openrouter/free`)
 
 ## Notes
 
