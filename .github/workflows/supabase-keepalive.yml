@@ -1,0 +1,32 @@
+name: Supabase Keep Alive
+
+on:
+  schedule:
+    # Berjalan setiap 3 hari pada pukul 09:00 WIB
+    - cron: "0 2 */3 * *"
+
+  # Bisa dijalankan manual dari GitHub Actions
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping Supabase
+        run: |
+          echo "Checking Supabase..."
+
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/keep_alive?select=id&limit=1" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}")
+
+          echo "HTTP Status: $RESPONSE"
+
+          if [ "$RESPONSE" != "200" ]; then
+            echo "Supabase ping failed!"
+            exit 1
+          fi
+
+          echo "Supabase is active!"

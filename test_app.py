@@ -46,5 +46,20 @@ class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error.exception.status_code, 400)
 
 
+class EmbeddingTests(unittest.TestCase):
+    def test_embedding_retries_gateway_timeout(self):
+        gateway_error = RuntimeError("Server error '504 Gateway Time-out'")
+        with patch.object(app, "hf_client") as client, \
+             patch.object(app, "time") as time_module, \
+             patch.object(app, "EXPECTED_EMBEDDING_DIMENSION", None):
+            client.feature_extraction.side_effect = [gateway_error, [0.1, 0.2]]
+
+            embedding = app.embed_text("teks")
+
+        self.assertEqual(embedding, [0.1, 0.2])
+        self.assertEqual(client.feature_extraction.call_count, 2)
+        time_module.sleep.assert_called_once_with(1)
+
+
 if __name__ == "__main__":
     unittest.main()

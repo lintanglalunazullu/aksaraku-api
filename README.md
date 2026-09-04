@@ -51,6 +51,7 @@ uvicorn app:app --host 0.0.0.0 --port 3000 --reload
 - `HUGGINGFACE_API_KEY`
 - `HUGGINGFACE_EMBEDDING_MODEL`
 - `EXPECTED_EMBEDDING_DIMENSION`
+- `HUGGINGFACE_EMBEDDING_RETRIES` (default: `3`, retries transient 502/503/504 and timeout errors)
 - `SUPABASE_TABLE`
 - `SUPABASE_VECTOR_FUNCTION`
 - `GROQ_API_KEY`
@@ -61,4 +62,5 @@ uvicorn app:app --host 0.0.0.0 --port 3000 --reload
 ## Notes
 
 - The API uses `pdf_documents` by default, matching the Node.js reference schema.
+- The embedding model must match the vector dimension configured in Supabase. For example, `sentence-transformers/all-MiniLM-L6-v2` produces 384 dimensions, while `BAAI/bge-m3` produces 1024 dimensions.
 - Keep your service role key and Hugging Face API key on the server only.

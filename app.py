@@ -10,6 +10,7 @@ import math
 import inspect
 from openai import OpenAI
 import logging
+import time
 from numbers import Number
 from typing import Sequence
 import numpy as np
@@ -24,8 +25,12 @@ HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
 HUGGINGFACE_EMBEDDING_MODEL = os.getenv(
     "HUGGINGFACE_EMBEDDING_MODEL", "BAAI/bge-m3"
 )
-EXPECTED_EMBEDDING_DIMENSION = os.getenv("EXPECTED_EMBEDDING_DIMENSION")
+EXPECTED_EMBEDDING_DIMENSION = os.getenv(
+    "EXPECTED_EMBEDDING_DIMENSION",
+    os.getenv("HUGGINGFACE_EXPECTED_EMBEDDING_DIMENSION"),
+)
 EXPECTED_EMBEDDING_DIMENSION = int(EXPECTED_EMBEDDING_DIMENSION) if EXPECTED_EMBEDDING_DIMENSION else None
+HUGGINGFACE_EMBEDDING_RETRIES = max(1, int(os.getenv("HUGGINGFACE_EMBEDDING_RETRIES", "3")))
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "pdf_documents")
 VECTOR_FUNCTION = os.getenv("SUPABASE_VECTOR_FUNCTION", "match_pdf_documents")
 SUPABASE_METADATA_COLUMN = os.getenv("SUPABASE_METADATA_COLUMN", "metadata")
@@ -183,6 +188,13 @@ def validate_embedding(embedding: Any) -> bool:
     return True
 
 
+def _is_retryable_huggingface_error(error: Exception) -> bool:
+    status_code = getattr(error, "status_code", None)
+    return status_code in (502, 503, 504) or any(
+        marker in str(error) for marker in ("502", "503", "504", "timed out", "timeout")
+    )
+
+
 def embed_text(text: str) -> List[float]:
     if not hf_client:
         raise HTTPException(
@@ -191,15 +203,38 @@ def embed_text(text: str) -> List[float]:
         )
 
     result = None
-    try:
-        result = hf_client.feature_extraction(text, model=HUGGINGFACE_EMBEDDING_MODEL)
-    except Exception as e:
-        detail = (
-            f"Hugging Face request failed. Error: {e}. "
-            f"Ensure `HUGGINGFACE_EMBEDDING_MODEL` is an embedding-capable model, "
-            f"e.g. 'sentence-transformers/all-MiniLM-L6-v2'."
+    for attempt in range(HUGGINGFACE_EMBEDDING_RETRIES):
+        try:
+            result = hf_client.feature_extraction(text, model=HUGGINGFACE_EMBEDDING_MODEL)
+            break
+        except Exception as error:
+            is_last_attempt = attempt == HUGGINGFACE_EMBEDDING_RETRIES - 1
+            if is_last_attempt or not _is_retryable_huggingface_error(error):
+                detail = (
+                    f"Hugging Face request failed. Error: {error}. "
+                    f"Ensure `HUGGINGFACE_EMBEDDING_MODEL` is an embedding-capable model, "
+                    f"e.g. 'sentence-transformers/all-MiniLM-L6-v2'."
+                )
+                raise HTTPException(status_code=500, detail=detail)
+            delay = 2 ** attempt
+            logger.warning(
+                "Hugging Face embedding attempt %s/%s failed; retrying in %ss: %s",
+                attempt + 1,
+                HUGGINGFACE_EMBEDDING_RETRIES,
+                delay,
+                error,
+            )
+            time.sleep(delay)
+
+    if result is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Hugging Face returned no embedding result. "
+                f"Ensure `HUGGINGFACE_EMBEDDING_MODEL` is an embedding-capable model, "
+                f"e.g. 'sentence-transformers/all-MiniLM-L6-v2'."
+            ),
         )
-        raise HTTPException(status_code=500, detail=detail)
 
     logger.info(
         "Embedding model=%s expected_dim=%s raw_type=%s raw_shape=%s",
