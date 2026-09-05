@@ -464,10 +464,95 @@ def _document_summary(rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
     return list(docs.values())
 
 
+def _fetch_table_rows(table_name: str, limit: int = 1000) -> List[Dict[str, Any]]:
+    response = supabase.table(table_name).select("*").limit(limit).execute()
+    parts = _extract_response_parts(response)
+    if parts["error"]:
+        raise HTTPException(500, str(parts["error"]))
+    return parts["data"] or []
+
+
+def _dashboard_activity(rows: List[Dict[str, Any]], label: str, name_key: str) -> List[Dict[str, Any]]:
+    activities = []
+    for row in rows:
+        name = row.get(name_key) or row.get("title") or row.get("content") or "Aktivitas baru"
+        timestamp = row.get("updated_at") or row.get("created_at") or row.get("inserted_at")
+        activities.append({"label": label, "name": str(name)[:120], "timestamp": timestamp})
+    return activities
+
+
 # ========================= ROUTES =========================
 @app.get("/health")
 async def health():
     return {"status":"ok","service":"Aksaraku","embedding_model":HUGGINGFACE_EMBEDDING_MODEL,"embedding_dimension":EXPECTED_EMBEDDING_DIMENSION,"rag_top_k":RAG_TOP_K,"rag_final_k":RAG_FINAL_K,"context_tokens":MAX_CONTEXT_TOKENS}
+
+
+@app.get("/admin/dashboard")
+async def admin_dashboard(authorization: Optional[str] = Header(default=None)):
+    _, role = _authenticated_user(authorization)
+    if role != "admin":
+        raise HTTPException(403, "Admin role is required")
+
+    document_rows = _fetch_table_rows(SUPABASE_TABLE, 10000)
+    profiles = _fetch_table_rows("profiles", 1000)
+    sessions = _fetch_table_rows(SESSION_TABLE, 1000)
+    messages = _fetch_table_rows(MESSAGE_TABLE, 1000)
+    documents = _document_summary(document_rows)
+
+    category_counts = {"public": 0, "private": 0}
+    for document in documents:
+        category = str(document.get("category") or "public").lower()
+        category_counts[category if category in category_counts else "public"] += 1
+
+    role_counts = {"admin": 0, "teacher": 0, "user": 0, "other": 0}
+    for profile in profiles:
+        profile_role = str(profile.get("role") or "user").strip().lower()
+        role_counts[profile_role if profile_role in role_counts else "other"] += 1
+
+    recent_users = []
+    for profile in profiles:
+        recent_users.append({
+            "id": profile.get("id"),
+            "email": profile.get("email") or "",
+            "full_name": profile.get("full_name") or profile.get("email") or "Pengguna",
+            "role": str(profile.get("role") or "user").lower(),
+            "provider": profile.get("provider") or "email",
+            "created_at": profile.get("created_at"),
+        })
+    recent_users.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+
+    messages_role_counts = {"user": 0, "assistant": 0}
+    for message in messages:
+        message_role = str(message.get("role") or "").lower()
+        if message_role == "user":
+            messages_role_counts["user"] += 1
+        elif message_role == "assistant":
+            messages_role_counts["assistant"] += 1
+
+    activities = (
+        _dashboard_activity(documents, "Dokumen", "pdf_name")
+        + _dashboard_activity(sessions, "Sesi chat", "title")
+        + _dashboard_activity(messages, "Pesan AI", "content")
+        + _dashboard_activity(recent_users, "Pengguna", "full_name")
+    )
+    activities.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+
+    return {
+        "stats": {
+            "documents": len(documents),
+            "chunks": len(document_rows),
+            "users": len(profiles),
+            "sessions": len(sessions),
+            "messages": len(messages),
+            "public_documents": category_counts["public"],
+            "private_documents": category_counts["private"],
+            "users_by_role": role_counts,
+            "messages_by_role": messages_role_counts,
+        },
+        "documents": documents[:8],
+        "activity": activities[:10],
+        "recent_users": recent_users[:8],
+    }
 
 @app.get("/documents")
 async def list_documents():

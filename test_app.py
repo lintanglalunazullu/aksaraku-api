@@ -233,5 +233,62 @@ class FakeProfileTable:
         return self.response
 
 
+class DashboardAdminTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.table_rows = {
+            app.SUPABASE_TABLE: [
+                {"pdf_name": "Profil.pdf", "content": "Bagian", "category": "public", "created_at": "2026-09-01T00:00:00Z"},
+                {"pdf_name": "Profil.pdf", "content": "Bagian 2", "category": "public", "created_at": "2026-09-01T00:00:00Z"},
+                {"pdf_name": "Rahasia.pdf", "content": "Isi", "category": "private", "created_at": "2026-09-02T00:00:00Z"},
+            ],
+            "profiles": [
+                {"id": "u1", "email": "admin@aksaraku.id", "full_name": "Admin Satu", "role": "admin", "provider": "email", "created_at": "2026-08-01T00:00:00Z"},
+                {"id": "u2", "email": "guru@aksaraku.id", "full_name": "Guru Dua", "role": "teacher", "provider": "email", "created_at": "2026-09-04T00:00:00Z"},
+                {"id": "u3", "email": "murid@aksaraku.id", "full_name": "Murid Tiga", "role": "user", "provider": "google", "created_at": "2026-09-05T00:00:00Z"},
+            ],
+            app.SESSION_TABLE: [
+                {"id": "s1", "title": "Sesi tanya", "created_at": "2026-09-05T01:00:00Z"},
+            ],
+            app.MESSAGE_TABLE: [
+                {"session_id": "s1", "role": "user", "content": "Apa itu NPSN?", "inserted_at": "2026-09-05T01:01:00Z"},
+                {"session_id": "s1", "role": "assistant", "content": "NPSN adalah...", "inserted_at": "2026-09-05T01:02:00Z"},
+            ],
+        }
+
+    def _fake_table(self, name):
+        return FakeDocumentTable(self.table_rows[name])
+
+    async def test_non_admin_is_rejected(self):
+        with patch.object(app, "_authenticated_user", return_value=("u1", "user")):
+            with self.assertRaises(HTTPException) as error:
+                await app.admin_dashboard()
+        self.assertEqual(error.exception.status_code, 403)
+
+    async def test_dashboard_returns_aggregated_stats(self):
+        with patch.object(app, "_authenticated_user", return_value=("u1", "admin")), \
+             patch.object(app.supabase, "table", side_effect=self._fake_table):
+            response = await app.admin_dashboard()
+
+        stats = response["stats"]
+        self.assertEqual(stats["documents"], 2)
+        self.assertEqual(stats["chunks"], 3)
+        self.assertEqual(stats["users"], 3)
+        self.assertEqual(stats["sessions"], 1)
+        self.assertEqual(stats["messages"], 2)
+        self.assertEqual(stats["public_documents"], 1)
+        self.assertEqual(stats["private_documents"], 1)
+        self.assertEqual(stats["users_by_role"], {"admin": 1, "teacher": 1, "user": 1, "other": 0})
+        self.assertEqual(stats["messages_by_role"], {"user": 1, "assistant": 1})
+
+    async def test_dashboard_returns_recent_users_sorted(self):
+        with patch.object(app, "_authenticated_user", return_value=("u1", "admin")), \
+             patch.object(app.supabase, "table", side_effect=self._fake_table):
+            response = await app.admin_dashboard()
+
+        self.assertEqual(response["recent_users"][0]["full_name"], "Murid Tiga")
+        self.assertEqual(response["recent_users"][1]["full_name"], "Guru Dua")
+        self.assertEqual(response["recent_users"][2]["full_name"], "Admin Satu")
+
+
 if __name__ == "__main__":
     unittest.main()
