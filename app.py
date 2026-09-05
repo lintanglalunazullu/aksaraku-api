@@ -364,9 +364,10 @@ Jangan mengarang fakta, angka, nama, tanggal, atau sumber.
 Jika informasi tidak ditemukan, katakan bahwa informasi tidak ditemukan pada dokumen yang tersedia.
 Jangan menampilkan similarity score, confidence score, atau nilai akurasi internal.
 Jika SOURCE bertentangan, jelaskan bahwa terdapat perbedaan data dan jangan memilih secara sembarangan.
-Keluarkan hanya jawaban final untuk pengguna. Jangan menampilkan proses berpikir, analisis internal,
-langkah pemindaian SOURCE, catatan perencanaan, atau kalimat seperti "Analyze User Input",
-"Let's go through", "We need to answer", atau "I should".
+Mulai jawaban langsung dengan isi jawaban. Jawab secara langsung, ringkas, dan tidak bertele-tele.
+Jangan pernah menampilkan proses berpikir, langkah pemecahan masalah, analisis internal, ringkasan instruksi,
+atau komentar tentang format jawaban. Larang keras menulis kata-kata seperti "Analisis Masukan", "Berikut proses
+berpikir", "Langkah untuk menyelesaikan", dan sejenisnya.
 Gunakan format yang mudah dibaca:
 - Gunakan heading Markdown seperlunya untuk memisahkan topik.
 - Gunakan daftar bernomor untuk urutan atau daftar nama.
@@ -398,10 +399,13 @@ def _usage(response: Any) -> Dict[str, Optional[int]]:
     return {"prompt_tokens":g("prompt_tokens"),"completion_tokens":g("completion_tokens"),"total_tokens":g("total_tokens")}
 
 
-def generate_with_fallback_with_usage(question: str, context: str, history: List[Dict[str,str]]) -> tuple[str,str,Dict[str,Optional[int]]]:
+def generate_with_fallback_with_usage(question: str, context: str, history: List[Dict[str,str]], force_direct: bool = False) -> tuple[str,str,Dict[str,Optional[int]]]:
     messages=[{"role":"system","content":SYSTEM_PROMPT.strip()}]
     messages.extend(history[-SESSION_HISTORY_LIMIT:])
-    messages.append({"role":"user","content":f"SOURCE DOKUMEN:\n\n{context or '[Tidak ada SOURCE yang relevan]'}\n\nPERTANYAAN:\n{question}\n\nJAWAB:"})
+    user_content=f"SOURCE DOKUMEN:\n\n{context or '[Tidak ada SOURCE yang relevan]'}\n\nPERTANYAAN:\n{question}\n\nJAWAB:"
+    if force_direct:
+        user_content += "\n\nPENTING: Jawab langsung dan sangat ringkas tanpa kalimat pengantar, tanpa proses berpikir, tanpa analisis."
+    messages.append({"role":"user","content":user_content})
     providers=[("groq",groq_client,GROQ_CHAT_MODEL),("openrouter",openrouter_client,OPENROUTER_CHAT_MODEL)]
     errors=[]
     for name,client,model in providers:
@@ -417,7 +421,22 @@ def generate_with_fallback_with_usage(question: str, context: str, history: List
     raise RuntimeError("All LLM providers failed. " + " | ".join(errors))
 
 
+def _strip_chain_of_thought(answer: str) -> str:
+    if not answer:
+        return answer
+    result = answer
+    for tag in ("reasoning", "chain_of_thought", "cot", "thinking", "scratchpad", "thought"):
+        result = re.sub(rf"<{tag}[^>]*>.*?</{tag}>", " ", result, flags=re.S | re.I)
+    lowered = result.lower()
+    for marker in ("jawaban akhir:", "jawaban:", "final answer:", "kesimpulan:", "output final:", "hasil jadinya:", "hasil:"):
+        offset = lowered.rfind(marker)
+        if offset >= 0:
+            return result[offset + len(marker):].strip()
+    return result
+
+
 def _clean_answer(answer: str) -> str:
+    answer = _strip_chain_of_thought(answer)
     patterns=[r"\s*\*{0,2}Tidak ada nilai akurasi yang tersedia dalam dokumen\.?\*{0,2}\s*", r"\s*nilai akurasi tidak tersedia\.?\s*"]
     for p in patterns: answer=re.sub(p," ",answer,flags=re.I)
     answer = re.sub(r"[ \t]{2,}", " ", answer)
@@ -638,6 +657,10 @@ async def chat(body:QueryRequest,authorization:Optional[str]=Header(default=None
     try:
         answer,provider,usage=generate_with_fallback_with_usage(question,context,history)
         answer=_clean_answer(answer)
+        if not answer:
+            logger.warning("LLM produced only chain-of-thought; retrying with direct-answer instruction")
+            answer,provider,usage=generate_with_fallback_with_usage(question,context,history,force_direct=True)
+            answer=_clean_answer(answer)
     except Exception as exc:
         raise HTTPException(502,f"All LLM providers failed: {exc}")
 

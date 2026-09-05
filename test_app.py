@@ -12,6 +12,18 @@ class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
         answer = "## Guru Bahasa Inggris\n\n1. **Santi Komalapuri**\n2. **Arum Nuraeni**"
         self.assertEqual(app._clean_answer(answer), answer)
 
+    def test_clean_answer_strips_chain_of_thought_blocks(self):
+        answer = "Here's a thinking process:\nLet's go through the sources...\n\nFinal Answer:\nSMP Negeri 2 Cibungbulang"
+        self.assertEqual(app._clean_answer(answer), "SMP Negeri 2 Cibungbulang")
+
+    def test_clean_answer_supports_indonesian_answer_marker(self):
+        answer = "Proses berpikir yang panjang tidak berguna\n\nJawaban:\nNama sekolah adalah SMPN 2 Cibungbulang."
+        self.assertEqual(app._clean_answer(answer), "Nama sekolah adalah SMPN 2 Cibungbulang.")
+
+    def test_clean_answer_removes_reasoning_tags(self):
+        answer = "<reasoning>Panjang</reasoning>Jawaban langsung."
+        self.assertEqual(app._clean_answer(answer), "Jawaban langsung.")
+
     async def _chat_with_answer(self, answer, docs=None, role="user"):
         docs = docs or [{"pdf_name": "Laporan.pdf", "content": "Isi dokumen"}]
         with patch.object(app, "_authenticated_role", return_value=role), \
