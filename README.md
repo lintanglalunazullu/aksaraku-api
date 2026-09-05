@@ -44,6 +44,18 @@ uvicorn app:app --host 0.0.0.0 --port 3000 --reload
   - Request body: `{ "question": "..." }`
   - Generates an embedding for the question and calls the Supabase RPC function configured by `SUPABASE_VECTOR_FUNCTION`.
 
+- `GET /documents`
+  - Returns documents grouped from `pdf_documents`, including `id`, `name`, `chunk_count`, `created_at`, and `status`.
+
+- `PUT /documents/:id`
+  - Request body: `{ "name": "Nama dokumen baru" }`
+  - Renames every stored chunk belonging to the document.
+
+- `DELETE /documents/:id`
+  - Deletes every stored chunk belonging to the document.
+
+The document `id` is the current `pdf_name`. Since this API file is `app.py`, start it with `uvicorn app:app`; `uvicorn main:app` will fail unless a separate `main.py` is added.
+
 ## Environment variables
 
 - `SUPABASE_URL`

@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
 
 from fastapi import HTTPException
 
@@ -7,9 +8,14 @@ import app
 
 
 class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
-    async def _chat_with_answer(self, answer, docs=None):
+    def test_clean_answer_preserves_markdown_structure(self):
+        answer = "## Guru Bahasa Inggris\n\n1. **Santi Komalapuri**\n2. **Arum Nuraeni**"
+        self.assertEqual(app._clean_answer(answer), answer)
+
+    async def _chat_with_answer(self, answer, docs=None, role="user"):
         docs = docs or [{"pdf_name": "Laporan.pdf", "content": "Isi dokumen"}]
-        with patch.object(app, "embed_text", return_value=[0.1]), \
+        with patch.object(app, "_authenticated_role", return_value=role), \
+             patch.object(app, "embed_text", return_value=[0.1]), \
              patch.object(app, "get_similar_documents", return_value=docs), \
              patch.object(app, "compress_context", return_value=("Isi dokumen", {"original_tokens": 2, "compressed_tokens": 2, "compression_ratio": 1.0, "sentences_kept": 1})), \
              patch.object(app, "generate_with_fallback_with_usage", return_value=(answer, "groq", {})):
@@ -32,7 +38,8 @@ class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["sources"], [{"pdf_name": "Laporan.pdf", "content": "Isi"}])
 
     async def test_provider_error_returns_502(self):
-        with patch.object(app, "embed_text", return_value=[0.1]), \
+        with patch.object(app, "_authenticated_role", return_value="user"), \
+             patch.object(app, "embed_text", return_value=[0.1]), \
              patch.object(app, "get_similar_documents", return_value=[]), \
              patch.object(app, "compress_context", return_value=("", {"original_tokens": 0, "compressed_tokens": 0, "compression_ratio": 0.0, "sentences_kept": 0})), \
              patch.object(app, "generate_with_fallback_with_usage", side_effect=RuntimeError("provider failed")):
@@ -41,9 +48,80 @@ class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error.exception.status_code, 502)
 
     async def test_empty_question_returns_400(self):
-        with self.assertRaises(HTTPException) as error:
-            await app.chat(app.QueryRequest(question="   "))
+        with patch.object(app, "_authenticated_role", return_value="user"):
+            with self.assertRaises(HTTPException) as error:
+                await app.chat(app.QueryRequest(question="   "))
         self.assertEqual(error.exception.status_code, 400)
+
+    async def test_request_without_token_returns_401(self):
+        with self.assertRaises(HTTPException) as error:
+            await app.chat(app.QueryRequest(question="Pertanyaan"))
+        self.assertEqual(error.exception.status_code, 401)
+
+    async def test_invalid_token_returns_401(self):
+        with patch.object(app.supabase.auth, "get_user", side_effect=RuntimeError("invalid token")):
+            with self.assertRaises(HTTPException) as error:
+                await app.chat(app.QueryRequest(question="Pertanyaan"), "Bearer invalid")
+        self.assertEqual(error.exception.status_code, 401)
+
+    async def test_user_chat_uses_public_documents_only(self):
+        docs = [
+            {"pdf_name": "Public.pdf", "content": "Publik", "category": "public"},
+            {"pdf_name": "Private.pdf", "content": "Rahasia", "category": "private"},
+            {"pdf_name": "Legacy.pdf", "content": "Lama tanpa kategori"},
+        ]
+        with patch.object(app, "embed_text", return_value=[0.1]), \
+             patch.object(app, "get_similar_documents", return_value=docs), \
+             patch.object(app, "generate_with_fallback_with_usage", return_value=("Jawaban.", "groq", {})):
+            with patch.object(app, "_authenticated_role", return_value="user"), \
+                 patch.object(app, "compress_context", side_effect=lambda question, selected, max_tokens: (self.assertEqual({doc["pdf_name"] for doc in selected}, {"Public.pdf", "Legacy.pdf"}) or ("Publik", {"original_tokens": 1, "compressed_tokens": 1, "compression_ratio": 1.0, "sentences_kept": 2}))):
+                response = await app.chat(app.QueryRequest(question="Pertanyaan"))
+        self.assertEqual({source["pdf_name"] for source in response["sources"]}, {"Public.pdf", "Legacy.pdf"})
+        self.assertNotIn("Private.pdf", response["sources"])
+
+    async def test_teacher_chat_can_use_private_documents(self):
+        docs = [
+            {"pdf_name": "Public.pdf", "content": "Publik", "category": "public"},
+            {"pdf_name": "Private.pdf", "content": "Rahasia", "category": "private"},
+        ]
+        with patch.object(app, "embed_text", return_value=[0.1]), \
+             patch.object(app, "get_similar_documents", return_value=docs), \
+             patch.object(app, "compress_context", side_effect=lambda question, selected, max_tokens: (self.assertEqual(len(selected), 2) or ("Semua", {"original_tokens": 1, "compressed_tokens": 1, "compression_ratio": 1.0, "sentences_kept": 2}))), \
+             patch.object(app, "generate_with_fallback_with_usage", return_value=("Jawaban.", "groq", {})), \
+             patch.object(app, "_authenticated_role", return_value="teacher"):
+            response = await app.chat(app.QueryRequest(question="Pertanyaan"))
+        self.assertEqual(len(response["sources"]), 2)
+
+    async def test_admin_chat_can_use_private_documents(self):
+        docs = [
+            {"pdf_name": "Public.pdf", "content": "Publik", "category": "public"},
+            {"pdf_name": "Private.pdf", "content": "Rahasia", "category": "private"},
+        ]
+        with patch.object(app, "_authenticated_role", return_value="admin"), \
+             patch.object(app, "embed_text", return_value=[0.1]), \
+             patch.object(app, "get_similar_documents", return_value=docs), \
+             patch.object(app, "compress_context", side_effect=lambda question, selected, max_tokens: (self.assertEqual(len(selected), 2) or ("Semua", {"original_tokens": 1, "compressed_tokens": 1, "compression_ratio": 1.0, "sentences_kept": 2}))), \
+             patch.object(app, "generate_with_fallback_with_usage", return_value=("Jawaban.", "groq", {})):
+            response = await app.chat(app.QueryRequest(question="Pertanyaan"))
+        self.assertEqual({source["pdf_name"] for source in response["sources"]}, {"Public.pdf", "Private.pdf"})
+
+
+class AuthenticationTests(unittest.TestCase):
+    def test_profile_role_is_loaded_from_supabase(self):
+        auth_response = SimpleNamespace(user=SimpleNamespace(id="user-1"))
+        profile_response = {"data": [{"role": "teacher"}], "error": None}
+        profile_table = FakeProfileTable(profile_response)
+        with patch.object(app.supabase.auth, "get_user", return_value=auth_response), \
+             patch.object(app.supabase, "table", return_value=profile_table):
+            self.assertEqual(app._authenticated_role("Bearer valid"), "teacher")
+
+    def test_missing_profile_returns_403(self):
+        auth_response = SimpleNamespace(user=SimpleNamespace(id="user-1"))
+        with patch.object(app.supabase.auth, "get_user", return_value=auth_response), \
+             patch.object(app.supabase, "table", return_value=FakeProfileTable({"data": [], "error": None})):
+            with self.assertRaises(HTTPException) as error:
+                app._authenticated_role("Bearer valid")
+        self.assertEqual(error.exception.status_code, 403)
 
 
 class EmbeddingTests(unittest.TestCase):
@@ -59,6 +137,100 @@ class EmbeddingTests(unittest.TestCase):
         self.assertEqual(embedding, [0.1, 0.2])
         self.assertEqual(client.feature_extraction.call_count, 2)
         time_module.sleep.assert_called_once_with(1)
+
+
+class DocumentEndpointTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.rows = [
+            {"pdf_name": "Laporan.pdf", "content": "Bagian 1", "created_at": "2026-01-02T00:00:00Z"},
+            {"pdf_name": "Laporan.pdf", "content": "Bagian 2", "created_at": "2026-01-02T00:00:00Z"},
+            {"pdf_name": "Panduan.pdf", "content": "Isi", "created_at": "2026-01-03T00:00:00Z"},
+        ]
+
+    def _table(self, name):
+        self.assertEqual(name, app.SUPABASE_TABLE)
+        return FakeDocumentTable(self.rows)
+
+    async def test_list_documents_groups_chunks(self):
+        with patch.object(app.supabase, "table", side_effect=self._table):
+            response = await app.list_documents()
+
+        self.assertEqual(response["data"][0]["id"], "Laporan.pdf")
+        self.assertEqual(response["data"][0]["chunk_count"], 2)
+        self.assertEqual(len(response["data"]), 2)
+
+    async def test_rename_updates_all_chunks(self):
+        table = FakeDocumentTable(self.rows)
+        with patch.object(app.supabase, "table", return_value=table):
+            response = await app.rename_document("Laporan.pdf", app.DocumentRenameRequest(name="Laporan Final.pdf"))
+
+        self.assertEqual(response["data"]["name"], "Laporan Final.pdf")
+        self.assertEqual(
+            [row["pdf_name"] for row in self.rows],
+            ["Laporan Final.pdf", "Laporan Final.pdf", "Panduan.pdf"],
+        )
+
+    async def test_delete_removes_all_chunks(self):
+        table = FakeDocumentTable(self.rows)
+        with patch.object(app.supabase, "table", return_value=table):
+            response = await app.delete_document("Laporan.pdf")
+
+        self.assertTrue(response["data"]["deleted"])
+        self.assertEqual([row["pdf_name"] for row in self.rows], ["Panduan.pdf"])
+
+
+class FakeDocumentTable:
+    def __init__(self, rows):
+        self.rows = rows
+        self.operation = "select"
+        self.payload = None
+        self.filter_name = None
+
+    def select(self, _columns):
+        self.operation = "select"
+        return self
+
+    def limit(self, _count):
+        return self
+
+    def update(self, payload):
+        self.operation = "update"
+        self.payload = payload
+        return self
+
+    def delete(self):
+        self.operation = "delete"
+        return self
+
+    def eq(self, name, value):
+        self.filter_name = value
+        return self
+
+    def execute(self):
+        if self.operation == "update":
+            for row in self.rows:
+                if row.get("pdf_name") == self.filter_name:
+                    row.update(self.payload)
+        elif self.operation == "delete":
+            self.rows[:] = [row for row in self.rows if row.get("pdf_name") != self.filter_name]
+        return {"data": self.rows, "error": None}
+
+
+class FakeProfileTable:
+    def __init__(self, response):
+        self.response = response
+
+    def select(self, _columns):
+        return self
+
+    def eq(self, _column, _value):
+        return self
+
+    def limit(self, _count):
+        return self
+
+    def execute(self):
+        return self.response
 
 
 if __name__ == "__main__":
