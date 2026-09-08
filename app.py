@@ -642,6 +642,36 @@ async def admin_dashboard(authorization: Optional[str] = Header(default=None)):
         "recent_users": recent_users[:8],
     }
 
+
+@app.delete("/admin/users/{user_id}")
+async def delete_admin_user(user_id: str, authorization: Optional[str] = Header(default=None)):
+    admin_id, role = _authenticated_user(authorization)
+    if role != "admin":
+        raise HTTPException(403, "Admin role is required")
+    if user_id == admin_id:
+        raise HTTPException(400, "Admin tidak dapat menghapus akun sendiri")
+
+    try:
+        result = supabase.auth.admin.delete_user(user_id)
+        parts = _extract_response_parts(result)
+        if parts["error"]:
+            raise RuntimeError(str(parts["error"]))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Auth user deletion failed: %s", exc)
+        raise HTTPException(500, "Gagal menghapus akun Auth")
+
+    try:
+        profile_result = supabase.table("profiles").delete().eq("id", user_id).execute()
+        parts = _extract_response_parts(profile_result)
+        if parts["error"]:
+            logger.warning("Profile deletion after Auth deletion failed: %s", parts["error"])
+    except Exception as exc:
+        logger.warning("Profile deletion after Auth deletion failed: %s", exc)
+
+    return {"success": True, "user_id": user_id}
+
 @app.get("/documents")
 async def list_documents():
     return {"data":_document_summary(_fetch_document_rows())}
