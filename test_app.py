@@ -8,6 +8,21 @@ import app
 
 
 class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
+    def test_unprivileged_retrieval_rejects_uncategorized_rpc_rows(self):
+        rpc_response = SimpleNamespace(execute=lambda: {
+            "data": [{"pdf_name": "Private.pdf", "content": "Rahasia"}],
+            "error": None,
+        })
+        table_rows = [
+            {"pdf_name": "Public.pdf", "content": "Publik", "category": "public", "embedding": [1.0, 0.0]},
+            {"pdf_name": "Private.pdf", "content": "Rahasia", "category": "private", "embedding": [1.0, 0.0]},
+        ]
+        with patch.object(app.supabase, "rpc", return_value=rpc_response), \
+             patch.object(app, "_fetch_document_rows", return_value=table_rows):
+            documents = app.get_similar_documents([1.0, 0.0], "anonymous", 5)
+
+        self.assertEqual([document["pdf_name"] for document in documents], ["Public.pdf"])
+
     def test_clean_answer_preserves_markdown_structure(self):
         answer = "## Guru Bahasa Inggris\n\n1. **Santi Komalapuri**\n2. **Arum Nuraeni**"
         self.assertEqual(app._clean_answer(answer), answer)

@@ -248,6 +248,16 @@ def filter_documents_for_role(documents: List[Dict[str, Any]], role: str) -> Lis
     ]
 
 
+def filter_rpc_documents_for_role(documents: List[Dict[str, Any]], role: str) -> List[Dict[str, Any]]:
+    if role in {"teacher", "admin"}:
+        return filter_documents_for_role(documents, role)
+    # An RPC row without category cannot be proven public. Do not expose it.
+    return [
+        document for document in documents
+        if str(document.get("category") or "").strip().lower() == "public"
+    ]
+
+
 def _table_similar_documents(query_embedding: List[float], categories: set[str], top_k: int) -> List[Dict[str, Any]]:
     try:
         rows = _fetch_document_rows()
@@ -329,8 +339,10 @@ def get_similar_documents(query_embedding: List[float], role: str, top_k: int = 
         response = supabase.rpc(VECTOR_FUNCTION, {"query_embedding": query_embedding, "match_threshold": RAG_MIN_SIMILARITY, "match_count": top_k, "category_filter": categories}).execute()
         parts = _extract_response_parts(response)
         if not parts["error"] and parts["data"]:
-            rpc_documents = filter_documents_for_role(parts["data"], role)
-            if role not in {"teacher", "admin"} or any(str(document.get("category") or "public").strip().lower() == "private" for document in rpc_documents):
+            rpc_documents = filter_rpc_documents_for_role(parts["data"], role)
+            if role not in {"teacher", "admin"} and rpc_documents:
+                return rpc_documents
+            if role in {"teacher", "admin"} and any(str(document.get("category") or "public").strip().lower() == "private" for document in rpc_documents):
                 return rpc_documents
             fallback_documents = _table_similar_documents(query_embedding, category_set, top_k)
             return _merge_similar_documents(rpc_documents, fallback_documents, top_k)
@@ -341,8 +353,10 @@ def get_similar_documents(query_embedding: List[float], role: str, top_k: int = 
         response = supabase.rpc(VECTOR_FUNCTION, {"query_embedding": query_embedding, "match_threshold": RAG_MIN_SIMILARITY, "match_count": max(top_k * 3, 15)}).execute()
         parts = _extract_response_parts(response)
         if not parts["error"]:
-            rpc_documents = [r for r in (parts["data"] or []) if str(r.get("category") or "public").strip().lower() in category_set]
-            if role not in {"teacher", "admin"} or any(str(document.get("category") or "public").strip().lower() == "private" for document in rpc_documents):
+            rpc_documents = filter_rpc_documents_for_role(parts["data"] or [], role)
+            if role not in {"teacher", "admin"} and rpc_documents:
+                return rpc_documents[:top_k]
+            if role in {"teacher", "admin"} and any(str(document.get("category") or "public").strip().lower() == "private" for document in rpc_documents):
                 return rpc_documents[:top_k]
             fallback_documents = _table_similar_documents(query_embedding, category_set, top_k)
             return _merge_similar_documents(rpc_documents, fallback_documents, top_k)
