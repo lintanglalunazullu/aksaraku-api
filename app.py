@@ -227,6 +227,13 @@ def _authenticated_role(authorization: Optional[str]) -> str:
     return _authenticated_user(authorization)[1]
 
 
+def _chat_role(authorization: Optional[str]) -> str:
+    """Return a public role for anonymous chat requests; validate supplied tokens."""
+    if not isinstance(authorization, str) or not authorization.strip():
+        return "anonymous"
+    return _authenticated_role(authorization)
+
+
 def allowed_categories(role: str) -> List[str]:
     return ["public", "private"] if role in {"teacher", "admin"} else ["public"]
 
@@ -642,13 +649,16 @@ async def query_docs(body:QueryRequest,authorization:Optional[str]=Header(defaul
 
 @app.post("/chat")
 async def chat(body:QueryRequest,authorization:Optional[str]=Header(default=None)):
-    role=_authenticated_role(authorization)
+    role=_chat_role(authorization)
     question=body.question.strip()
     if not question: raise HTTPException(400,"question is required")
-    ensure_session(body.session_id)
-    history=get_session_history(body.session_id)
+    persist_session = role != "anonymous"
+    if persist_session:
+        ensure_session(body.session_id)
+    history=get_session_history(body.session_id) if persist_session else []
     search_query=build_search_query(question,history)
-    save_message(body.session_id,"user",question)
+    if persist_session:
+        save_message(body.session_id,"user",question)
 
     retrieved = get_similar_documents(embed_text(search_query), role, RAG_TOP_K)
     docs=rerank_documents(search_query,filter_documents_for_role(retrieved, role),RAG_FINAL_K)
@@ -664,7 +674,8 @@ async def chat(body:QueryRequest,authorization:Optional[str]=Header(default=None
     except Exception as exc:
         raise HTTPException(502,f"All LLM providers failed: {exc}")
 
-    save_message(body.session_id,"assistant",answer)
+    if persist_session:
+        save_message(body.session_id,"assistant",answer)
     prompt_estimate=estimate_tokens(SYSTEM_PROMPT+"\n"+context+"\n"+question)
     evidence=calculate_evidence_confidence(question,docs,answer)
 

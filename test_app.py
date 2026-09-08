@@ -65,10 +65,30 @@ class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
                 await app.chat(app.QueryRequest(question="   "))
         self.assertEqual(error.exception.status_code, 400)
 
-    async def test_request_without_token_returns_401(self):
-        with self.assertRaises(HTTPException) as error:
-            await app.chat(app.QueryRequest(question="Pertanyaan"))
-        self.assertEqual(error.exception.status_code, 401)
+    async def test_request_without_token_returns_public_chat(self):
+        with patch.object(app, "embed_text", return_value=[0.1]), \
+             patch.object(app, "get_similar_documents", return_value=[]), \
+             patch.object(app, "generate_with_fallback_with_usage", return_value=("Jawaban publik.", "groq", {})):
+            response = await app.chat(app.QueryRequest(question="Pertanyaan"))
+        self.assertEqual(response["answer"], "Jawaban publik.")
+
+    async def test_anonymous_chat_uses_public_documents_without_persisting_session(self):
+        docs = [
+            {"pdf_name": "Public.pdf", "content": "Publik", "category": "public"},
+            {"pdf_name": "Private.pdf", "content": "Rahasia", "category": "private"},
+        ]
+        with patch.object(app, "embed_text", return_value=[0.1]), \
+             patch.object(app, "get_similar_documents", return_value=docs) as search, \
+             patch.object(app, "generate_with_fallback_with_usage", return_value=("Jawaban publik.", "groq", {})), \
+             patch.object(app, "ensure_session") as ensure, \
+             patch.object(app, "save_message") as save, \
+             patch.object(app, "compress_context", side_effect=lambda question, selected, max_tokens: (self.assertEqual({doc["pdf_name"] for doc in selected}, {"Public.pdf"}) or ("Publik", {"original_tokens": 1, "compressed_tokens": 1, "compression_ratio": 1.0, "sentences_kept": 1}))):
+            response = await app.chat(app.QueryRequest(question="Pertanyaan", session_id="anonymous-session"))
+
+        self.assertEqual(response["sources"], [{"pdf_name": "Public.pdf", "content": "Publik", "category": "public"}])
+        search.assert_called_once_with([0.1], "anonymous", app.RAG_TOP_K)
+        ensure.assert_not_called()
+        save.assert_not_called()
 
     async def test_invalid_token_returns_401(self):
         with patch.object(app.supabase.auth, "get_user", side_effect=RuntimeError("invalid token")):
@@ -101,7 +121,7 @@ class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
              patch.object(app, "compress_context", side_effect=lambda question, selected, max_tokens: (self.assertEqual(len(selected), 2) or ("Semua", {"original_tokens": 1, "compressed_tokens": 1, "compression_ratio": 1.0, "sentences_kept": 2}))), \
              patch.object(app, "generate_with_fallback_with_usage", return_value=("Jawaban.", "groq", {})), \
              patch.object(app, "_authenticated_role", return_value="teacher"):
-            response = await app.chat(app.QueryRequest(question="Pertanyaan"))
+            response = await app.chat(app.QueryRequest(question="Pertanyaan"), "Bearer teacher-token")
         self.assertEqual(len(response["sources"]), 2)
 
     async def test_admin_chat_can_use_private_documents(self):
@@ -114,7 +134,7 @@ class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
              patch.object(app, "get_similar_documents", return_value=docs), \
              patch.object(app, "compress_context", side_effect=lambda question, selected, max_tokens: (self.assertEqual(len(selected), 2) or ("Semua", {"original_tokens": 1, "compressed_tokens": 1, "compression_ratio": 1.0, "sentences_kept": 2}))), \
              patch.object(app, "generate_with_fallback_with_usage", return_value=("Jawaban.", "groq", {})):
-            response = await app.chat(app.QueryRequest(question="Pertanyaan"))
+            response = await app.chat(app.QueryRequest(question="Pertanyaan"), "Bearer admin-token")
         self.assertEqual({source["pdf_name"] for source in response["sources"]}, {"Public.pdf", "Private.pdf"})
 
 
