@@ -242,8 +242,43 @@ def filter_documents_for_role(documents: List[Dict[str, Any]], role: str) -> Lis
     categories = set(allowed_categories(role))
     return [
         document for document in documents
-        if str(document.get("category") or "public").strip().lower() in categories
+        if (
+            role in {"teacher", "admin"} and not document.get("category")
+        ) or str(document.get("category") or "public").strip().lower() in categories
     ]
+
+
+def _table_similar_documents(query_embedding: List[float], categories: set[str], top_k: int) -> List[Dict[str, Any]]:
+    try:
+        rows = _fetch_document_rows()
+    except Exception as exc:
+        logger.warning("Table vector fallback failed: %s", exc)
+        return []
+
+    matches = []
+    for row in rows:
+        category = str(row.get("category") or "public").strip().lower()
+        if category not in categories:
+            continue
+        embedding = _parse_embedding(row.get("embedding"))
+        similarity = _cosine_similarity(query_embedding, embedding or [])
+        if similarity >= RAG_MIN_SIMILARITY:
+            document = dict(row)
+            document["similarity"] = similarity
+            matches.append(document)
+
+    matches.sort(key=lambda document: float(document.get("similarity") or 0), reverse=True)
+    return matches[:top_k]
+
+
+def _merge_similar_documents(rpc_documents: List[Dict[str, Any]], fallback_documents: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    merged = {}
+    for document in rpc_documents + fallback_documents:
+        key = document.get("id") or (document.get("pdf_name"), document.get("content"))
+        current = merged.get(key)
+        if current is None or float(document.get("similarity") or 0) > float(current.get("similarity") or 0):
+            merged[key] = document
+    return sorted(merged.values(), key=lambda document: float(document.get("similarity") or 0), reverse=True)[:top_k]
 
 
 # ========================= SESSION =========================
@@ -288,12 +323,17 @@ def build_search_query(question: str, history: List[Dict[str, str]]) -> str:
 # ========================= RETRIEVAL =========================
 def get_similar_documents(query_embedding: List[float], role: str, top_k: int = RAG_TOP_K) -> List[Dict[str, Any]]:
     categories = allowed_categories(role)
+    category_set = set(categories)
     # Preferred RPC: add category_filter to SQL function for DB-level access control.
     try:
         response = supabase.rpc(VECTOR_FUNCTION, {"query_embedding": query_embedding, "match_threshold": RAG_MIN_SIMILARITY, "match_count": top_k, "category_filter": categories}).execute()
         parts = _extract_response_parts(response)
         if not parts["error"] and parts["data"]:
-            return parts["data"]
+            rpc_documents = filter_documents_for_role(parts["data"], role)
+            if role not in {"teacher", "admin"} or any(str(document.get("category") or "public").strip().lower() == "private" for document in rpc_documents):
+                return rpc_documents
+            fallback_documents = _table_similar_documents(query_embedding, category_set, top_k)
+            return _merge_similar_documents(rpc_documents, fallback_documents, top_k)
     except Exception as exc:
         logger.warning("Filtered vector RPC failed; trying compatibility RPC: %s", exc)
     # Compatibility path: still use vector RPC, then filter returned candidates.
@@ -301,10 +341,14 @@ def get_similar_documents(query_embedding: List[float], role: str, top_k: int = 
         response = supabase.rpc(VECTOR_FUNCTION, {"query_embedding": query_embedding, "match_threshold": RAG_MIN_SIMILARITY, "match_count": max(top_k * 3, 15)}).execute()
         parts = _extract_response_parts(response)
         if not parts["error"]:
-            return [r for r in (parts["data"] or []) if str(r.get("category") or "public").lower() in categories][:top_k]
+            rpc_documents = [r for r in (parts["data"] or []) if str(r.get("category") or "public").strip().lower() in category_set]
+            if role not in {"teacher", "admin"} or any(str(document.get("category") or "public").strip().lower() == "private" for document in rpc_documents):
+                return rpc_documents[:top_k]
+            fallback_documents = _table_similar_documents(query_embedding, category_set, top_k)
+            return _merge_similar_documents(rpc_documents, fallback_documents, top_k)
     except Exception as exc:
         logger.warning("Vector RPC failed: %s", exc)
-    return []
+    return _table_similar_documents(query_embedding, category_set, top_k)
 
 
 def rerank_documents(question: str, docs: List[Dict[str, Any]], final_k: int = RAG_FINAL_K) -> List[Dict[str, Any]]:
@@ -681,7 +725,7 @@ async def chat(body:QueryRequest,authorization:Optional[str]=Header(default=None
 
     return {
         "answer":answer,
-        "session_id":body.session_id,
+        "session_id":body.session_id if persist_session else None,
         "provider":provider,
         "sources":_public_sources(docs),
         "evidence":evidence,
