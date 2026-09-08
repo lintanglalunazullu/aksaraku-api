@@ -334,6 +334,10 @@ def build_search_query(question: str, history: List[Dict[str, str]]) -> str:
 def get_similar_documents(query_embedding: List[float], role: str, top_k: int = RAG_TOP_K) -> List[Dict[str, Any]]:
     categories = allowed_categories(role)
     category_set = set(categories)
+    # Never trust the RPC for unprivileged roles: its result may omit or misreport category.
+    if role not in {"teacher", "admin"}:
+        return _table_similar_documents(query_embedding, category_set, top_k)
+
     # Preferred RPC: add category_filter to SQL function for DB-level access control.
     try:
         response = supabase.rpc(VECTOR_FUNCTION, {"query_embedding": query_embedding, "match_threshold": RAG_MIN_SIMILARITY, "match_count": top_k, "category_filter": categories}).execute()

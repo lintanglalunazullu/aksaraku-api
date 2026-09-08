@@ -17,11 +17,12 @@ class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
             {"pdf_name": "Public.pdf", "content": "Publik", "category": "public", "embedding": [1.0, 0.0]},
             {"pdf_name": "Private.pdf", "content": "Rahasia", "category": "private", "embedding": [1.0, 0.0]},
         ]
-        with patch.object(app.supabase, "rpc", return_value=rpc_response), \
+        with patch.object(app.supabase, "rpc", return_value=rpc_response) as rpc, \
              patch.object(app, "_fetch_document_rows", return_value=table_rows):
             documents = app.get_similar_documents([1.0, 0.0], "anonymous", 5)
 
         self.assertEqual([document["pdf_name"] for document in documents], ["Public.pdf"])
+        rpc.assert_not_called()
 
     def test_clean_answer_preserves_markdown_structure(self):
         answer = "## Guru Bahasa Inggris\n\n1. **Santi Komalapuri**\n2. **Arum Nuraeni**"
