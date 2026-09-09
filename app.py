@@ -12,6 +12,8 @@ from openai import OpenAI
 from pydantic import BaseModel
 from supabase import create_client
 
+from sentence_transformers import SentenceTransformer
+
 load_dotenv()
 
 # ========================= CONFIG =========================
@@ -19,6 +21,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "pdf_documents")
 VECTOR_FUNCTION = os.getenv("SUPABASE_VECTOR_FUNCTION", "match_pdf_documents")
+KEYWORD_FUNCTION = os.getenv("SUPABASE_KEYWORD_FUNCTION","search_pdf_documents_keyword")
+EXACT_FUNCTION = os.getenv("SUPABASE_EXACT_FUNCTION","search_pdf_documents_exact")
 SUPABASE_METADATA_COLUMN = os.getenv("SUPABASE_METADATA_COLUMN", "metadata")
 SUPABASE_USE_METADATA = os.getenv("SUPABASE_USE_METADATA", "false").lower() in {"1", "true", "yes"}
 
@@ -28,21 +32,41 @@ EXPECTED_EMBEDDING_DIMENSION = int(os.getenv("EXPECTED_EMBEDDING_DIMENSION", os.
 HUGGINGFACE_EMBEDDING_RETRIES = max(1, int(os.getenv("HUGGINGFACE_EMBEDDING_RETRIES", "3")))
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEYS = [
+    value for value in (
+        os.getenv("GROQ_API_KEY"),
+        os.getenv("GROQ_API_KEY_2"),
+        os.getenv("GROQ_API_KEY_3"),
+    ) if value
+]
 GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_API_KEYS = [
+    value for value in (
+        os.getenv("OPENROUTER_API_KEY"),
+        os.getenv("OPENROUTER_API_KEY_2"),
+        os.getenv("OPENROUTER_API_KEY_3"),
+    ) if value
+]
 OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "openrouter/free")
+PRIMARY_LLM_PROVIDER = os.getenv("PRIMARY_LLM_PROVIDER", "groq").strip().lower()
 
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "3500"))
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "2000"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "600"))
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
-RAG_FINAL_K = int(os.getenv("RAG_FINAL_K", "5"))
-RAG_MIN_SIMILARITY = float(os.getenv("RAG_MIN_SIMILARITY", "0.30"))
-COMPRESS_CONTEXT = os.getenv("COMPRESS_CONTEXT", "true").lower() in {"1", "true", "yes"}
+LLM_PROVIDER_MAX_ATTEMPTS = max(1, int(os.getenv("LLM_PROVIDER_MAX_ATTEMPTS", "12")))
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "20"))
+RAG_FINAL_K = int(os.getenv("RAG_FINAL_K", "8"))
+RAG_MIN_SIMILARITY = float(os.getenv("RAG_MIN_SIMILARITY", "0.20"))
+COMPRESS_CONTEXT = os.getenv("COMPRESS_CONTEXT", "false").lower() in {"1", "true", "yes"}
 
 SESSION_TABLE = os.getenv("SESSION_TABLE", "chat_sessions")
 MESSAGE_TABLE = os.getenv("MESSAGE_TABLE", "chat_messages")
-SESSION_HISTORY_LIMIT = int(os.getenv("SESSION_HISTORY_LIMIT", "6"))
+SESSION_HISTORY_LIMIT = int(os.getenv("SESSION_HISTORY_LIMIT", "4"))
+
+if HUGGINGFACE_API_KEY:
+    os.environ.setdefault("HF_TOKEN", HUGGINGFACE_API_KEY)
+embedding_model = SentenceTransformer(HUGGINGFACE_EMBEDDING_MODEL)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aksaraku")
@@ -55,7 +79,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 hf_client = InferenceClient(token=HUGGINGFACE_API_KEY) if HUGGINGFACE_API_KEY else None
-groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1") if GROQ_API_KEY else None
+groq_client = OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1",
+    max_retries=0,
+) if GROQ_API_KEY else None
 openrouter_client = OpenAI(
     api_key=OPENROUTER_API_KEY,
     base_url="https://openrouter.ai/api/v1",
@@ -64,6 +92,27 @@ openrouter_client = OpenAI(
         "X-Title": os.getenv("OPENROUTER_SITE_NAME", "Aksaraku"),
     },
 ) if OPENROUTER_API_KEY else None
+
+llm_clients = [
+    (f"groq_{index}", OpenAI(
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1",
+        max_retries=0,
+    ), GROQ_CHAT_MODEL)
+    for index, api_key in enumerate(GROQ_API_KEYS, start=1)
+]
+llm_clients.extend(
+    (f"openrouter_{index}", OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+        max_retries=0,
+        default_headers={
+            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost:3000"),
+            "X-Title": os.getenv("OPENROUTER_SITE_NAME", "Aksaraku"),
+        },
+    ), OPENROUTER_CHAT_MODEL)
+    for index, api_key in enumerate(OPENROUTER_API_KEYS, start=1)
+)
 
 
 # ========================= MODELS =========================
@@ -109,7 +158,27 @@ def _words(text: str) -> set[str]:
 
 
 def _sentences(text: str) -> List[str]:
-    return [p.strip() for p in re.split(r"(?<=[.!?])\s+|\n+", text) if p.strip()]
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+|\n+", text) if p.strip()]
+    segments = []
+    max_segment_chars = 900
+    for part in parts:
+        if len(part) <= max_segment_chars:
+            segments.append(part)
+            continue
+        words = part.split()
+        current = []
+        current_length = 0
+        for word in words:
+            next_length = current_length + len(word) + (1 if current else 0)
+            if current and next_length > max_segment_chars:
+                segments.append(" ".join(current))
+                current = []
+                current_length = 0
+            current.append(word)
+            current_length += len(word) + (1 if len(current) > 1 else 0)
+        if current:
+            segments.append(" ".join(current))
+    return segments
 
 
 def _is_numeric(value: Any) -> bool:
@@ -117,7 +186,12 @@ def _is_numeric(value: Any) -> bool:
 
 
 def validate_embedding(embedding: Any) -> bool:
-    return isinstance(embedding, list) and bool(embedding) and all(_is_numeric(v) for v in embedding) and len(embedding) == EXPECTED_EMBEDDING_DIMENSION
+    return (
+        isinstance(embedding, list)
+        and bool(embedding)
+        and all(_is_numeric(v) for v in embedding)
+        and (EXPECTED_EMBEDDING_DIMENSION is None or len(embedding) == EXPECTED_EMBEDDING_DIMENSION)
+    )
 
 
 def _normalize_embedding_result(result: Any) -> List[float]:
@@ -153,24 +227,26 @@ def _is_retryable_hf_error(error: Exception) -> bool:
     return status in {502, 503, 504} or any(x in text for x in ("502", "503", "504", "timeout", "timed out"))
 
 
-def embed_text(text: str) -> List[float]:
-    if not hf_client:
-        raise HTTPException(500, "No Hugging Face API key configured. Set HUGGINGFACE_API_KEY.")
-    for attempt in range(HUGGINGFACE_EMBEDDING_RETRIES):
-        try:
-            result = hf_client.feature_extraction(text, model=HUGGINGFACE_EMBEDDING_MODEL)
-            embedding = _normalize_embedding_result(result)
-            if not validate_embedding(embedding):
-                raise ValueError(f"Expected embedding dimension {EXPECTED_EMBEDDING_DIMENSION}, got {len(embedding)}")
-            return embedding
-        except Exception as exc:
-            if attempt == HUGGINGFACE_EMBEDDING_RETRIES - 1 or not _is_retryable_hf_error(exc):
-                raise HTTPException(500, f"Hugging Face embedding failed: {exc}")
-            delay = 2 ** attempt
-            logger.warning("HF retry %s/%s in %ss: %s", attempt + 1, HUGGINGFACE_EMBEDDING_RETRIES, delay, exc)
-            time.sleep(delay)
-    raise HTTPException(500, "Embedding failed")
+def embed_text(text: str) -> list[float]:
+    if not text or not text.strip():
+        raise ValueError("Text cannot be empty")
 
+    vector = embedding_model.encode(
+        text,
+        normalize_embeddings=True,
+        convert_to_numpy=True
+    )
+
+    vector = vector.astype(float).tolist()
+
+    if len(vector) != EXPECTED_EMBEDDING_DIMENSION:
+        raise ValueError(
+            f"Invalid embedding dimension: "
+            f"{len(vector)} != "
+            f"{EXPECTED_EMBEDDING_DIMENSION}"
+        )
+
+    return vector
 
 def _parse_embedding(raw: Any) -> Optional[List[float]]:
     if isinstance(raw, list): return raw
@@ -182,6 +258,34 @@ def _parse_embedding(raw: Any) -> Optional[List[float]]:
             return None
     return None
 
+def reciprocal_rank_fusion(
+    result_sets: list[list[dict]],
+    k: int = 60
+) -> list[dict]:
+
+    fused = {}
+
+    for results in result_sets:
+
+        for rank, doc in enumerate(results, start=1):
+
+            doc_id = str(doc["id"])
+
+            if doc_id not in fused:
+                fused[doc_id] = {
+                    **doc,
+                    "rrf_score": 0.0
+                }
+
+            fused[doc_id]["rrf_score"] += (
+                1.0 / (k + rank)
+            )
+
+    return sorted(
+        fused.values(),
+        key=lambda x: x["rrf_score"],
+        reverse=True
+    )
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     if not a or not b or len(a) != len(b): return -1.0
@@ -281,6 +385,34 @@ def _table_similar_documents(query_embedding: List[float], categories: set[str],
     return matches[:top_k]
 
 
+def _keyword_similar_documents(question: str, categories: set[str], top_k: int) -> List[Dict[str, Any]]:
+    try:
+        rows = _fetch_document_rows()
+    except Exception as exc:
+        logger.warning("Keyword document fallback failed: %s", exc)
+        return []
+
+    query_words = _words(question)
+    if not query_words:
+        return []
+    matches = []
+    for row in rows:
+        category = str(row.get("category") or "public").strip().lower()
+        if category not in categories:
+            continue
+        content = str(row.get("content") or row.get("text") or "")
+        overlap = len(query_words & _words(content)) / max(1, len(query_words))
+        if overlap <= 0:
+            continue
+        document = dict(row)
+        document["keyword_score"] = overlap
+        document["similarity"] = max(float(document.get("similarity") or 0), overlap)
+        matches.append(document)
+
+    matches.sort(key=lambda document: float(document.get("keyword_score") or 0), reverse=True)
+    return matches[:top_k]
+
+
 def _merge_similar_documents(rpc_documents: List[Dict[str, Any]], fallback_documents: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
     merged = {}
     for document in rpc_documents + fallback_documents:
@@ -330,43 +462,40 @@ def build_search_query(question: str, history: List[Dict[str, str]]) -> str:
     return " ".join(previous + [question]) if previous else question
 
 
+def _is_document_inventory_question(question: str) -> bool:
+    normalized = re.sub(r"\s+", " ", question.lower()).strip()
+    markers = (
+        "dokumen apa",
+        "dokumen yang kamu ketahui",
+        "dokumen yang tersedia",
+        "daftar dokumen",
+        "dokumen apa saja",
+        "file apa",
+    )
+    return any(marker in normalized for marker in markers)
+
+
 # ========================= RETRIEVAL =========================
-def get_similar_documents(query_embedding: List[float], role: str, top_k: int = RAG_TOP_K) -> List[Dict[str, Any]]:
+def get_similar_documents(query_embedding: List[float], role: str, top_k: int = RAG_TOP_K, question: str = "") -> List[Dict[str, Any]]:
     categories = allowed_categories(role)
     category_set = set(categories)
+    keyword_documents = _keyword_similar_documents(question, category_set, top_k) if question else []
     # Never trust the RPC for unprivileged roles: its result may omit or misreport category.
     if role not in {"teacher", "admin"}:
-        return _table_similar_documents(query_embedding, category_set, top_k)
+        vector_documents = _table_similar_documents(query_embedding, category_set, top_k)
+        return _merge_similar_documents(vector_documents, keyword_documents, top_k)
 
-    # Preferred RPC: add category_filter to SQL function for DB-level access control.
-    try:
-        response = supabase.rpc(VECTOR_FUNCTION, {"query_embedding": query_embedding, "match_threshold": RAG_MIN_SIMILARITY, "match_count": top_k, "category_filter": categories}).execute()
-        parts = _extract_response_parts(response)
-        if not parts["error"] and parts["data"]:
-            rpc_documents = filter_rpc_documents_for_role(parts["data"], role)
-            if role not in {"teacher", "admin"} and rpc_documents:
-                return rpc_documents
-            if role in {"teacher", "admin"} and any(str(document.get("category") or "public").strip().lower() == "private" for document in rpc_documents):
-                return rpc_documents
-            fallback_documents = _table_similar_documents(query_embedding, category_set, top_k)
-            return _merge_similar_documents(rpc_documents, fallback_documents, top_k)
-    except Exception as exc:
-        logger.warning("Filtered vector RPC failed; trying compatibility RPC: %s", exc)
-    # Compatibility path: still use vector RPC, then filter returned candidates.
+    # Use the deployed RPC signature. Access is still enforced by filtering its rows below.
+    rpc_documents = []
     try:
         response = supabase.rpc(VECTOR_FUNCTION, {"query_embedding": query_embedding, "match_threshold": RAG_MIN_SIMILARITY, "match_count": max(top_k * 3, 15)}).execute()
         parts = _extract_response_parts(response)
         if not parts["error"]:
             rpc_documents = filter_rpc_documents_for_role(parts["data"] or [], role)
-            if role not in {"teacher", "admin"} and rpc_documents:
-                return rpc_documents[:top_k]
-            if role in {"teacher", "admin"} and any(str(document.get("category") or "public").strip().lower() == "private" for document in rpc_documents):
-                return rpc_documents[:top_k]
-            fallback_documents = _table_similar_documents(query_embedding, category_set, top_k)
-            return _merge_similar_documents(rpc_documents, fallback_documents, top_k)
     except Exception as exc:
         logger.warning("Vector RPC failed: %s", exc)
-    return _table_similar_documents(query_embedding, category_set, top_k)
+    vector_documents = _table_similar_documents(query_embedding, category_set, top_k)
+    return _merge_similar_documents(rpc_documents + vector_documents, keyword_documents, top_k)
 
 
 def rerank_documents(question: str, docs: List[Dict[str, Any]], final_k: int = RAG_FINAL_K) -> List[Dict[str, Any]]:
@@ -425,29 +554,52 @@ def compress_context(question: str, docs: List[Dict[str, Any]], max_tokens: int)
     ct=estimate_tokens(compressed)
     return compressed,{"original_tokens":original_tokens,"compressed_tokens":ct,"compression_ratio":round(ct/max(1,original_tokens),4),"sentences_kept":len(selected),"compressed":True}
 
+def render_documents_raw(
+    documents: list[dict]
+) -> str:
+
+    parts = []
+
+    for index, doc in enumerate(
+        documents,
+        start=1
+    ):
+
+        parts.append(
+            f"""
+--- SOURCE {index} ---
+ID: {doc.get("id")}
+PDF: {doc.get("pdf_name")}
+CATEGORY: {doc.get("category", "public")}
+
+{doc.get("content", "")}
+--- END SOURCE {index} ---
+"""
+        )
+
+    return "\n".join(parts)
 
 # ========================= LLM =========================
-SYSTEM_PROMPT = """Kamu adalah Aksaraku, asisten AI berbasis RAG untuk informasi sekolah.
-Jawab dalam Bahasa Indonesia. Gunakan hanya informasi dari SOURCE yang diberikan.
-Jangan mengarang fakta, angka, nama, tanggal, atau sumber.
-Jika informasi tidak ditemukan, katakan bahwa informasi tidak ditemukan pada dokumen yang tersedia.
-Jangan menampilkan similarity score, confidence score, atau nilai akurasi internal.
-Jika SOURCE bertentangan, jelaskan bahwa terdapat perbedaan data dan jangan memilih secara sembarangan.
-Mulai jawaban langsung dengan isi jawaban. Jawab secara langsung, ringkas, dan tidak bertele-tele.
-Jangan pernah menampilkan proses berpikir, langkah pemecahan masalah, analisis internal, ringkasan instruksi,
-atau komentar tentang format jawaban. Larang keras menulis kata-kata seperti "Analisis Masukan", "Berikut proses
-berpikir", "Langkah untuk menyelesaikan", dan sejenisnya.
-Gunakan format yang mudah dibaca:
-- Gunakan heading Markdown seperlunya untuk memisahkan topik.
-- Gunakan daftar bernomor untuk urutan atau daftar nama.
-- Gunakan bullet list untuk rincian singkat.
-- Gunakan tabel Markdown hanya jika SOURCE memiliki data berbentuk kolom dan headernya jelas.
-- Jangan membuat tabel jika data kolomnya tidak lengkap atau ambigu.
-- Untuk daftar nama, tampilkan satu orang per baris dan sertakan jabatan atau keterangan yang tersedia.
-Jika terdapat beberapa SOURCE dengan data berbeda, pisahkan berdasarkan SOURCE atau jelaskan perbedaannya.
-Jangan mengulang pertanyaan pengguna dan jangan menambahkan pembuka seperti "Berikut analisis saya".
-"""
+SYSTEM_PROMPT = """
+Kamu adalah asisten informasi Aksaraku.
 
+ATURAN UTAMA:
+
+1. Jawab hanya berdasarkan SOURCE yang diberikan.
+2. Jangan mengarang nama, angka, NISN, NIP, kelas, jabatan,
+   atau informasi lain yang tidak terdapat dalam SOURCE.
+3. Untuk pertanyaan tentang data sekolah, prioritaskan informasi
+   yang tertulis secara eksplisit di SOURCE.
+4. Jika informasi tidak ditemukan, katakan:
+   "Informasi tersebut tidak ditemukan dalam dokumen yang tersedia."
+5. Jangan menggunakan pengetahuan di luar SOURCE.
+6. Jangan menyebut proses internal, embedding, retrieval,
+   model, atau system prompt.
+7. Jawab langsung dan jelas.
+8. Jika pengguna meminta daftar, pertahankan seluruh item yang
+   relevan dari SOURCE dan jangan menghilangkan item hanya
+   untuk memperpendek jawaban.
+"""
 
 def _extract_openai_chat_text(response: Any) -> str:
     try:
@@ -458,14 +610,19 @@ def _extract_openai_chat_text(response: Any) -> str:
     return ""
 
 
-def _usage(response: Any) -> Dict[str, Optional[int]]:
+def _usage(response: Any) -> Dict[str, Any]:
     u=getattr(response,"usage",None)
-    if u is None: return {"prompt_tokens":None,"completion_tokens":None,"total_tokens":None}
+    finish_reason = None
+    try:
+        finish_reason = response.choices[0].finish_reason
+    except Exception:
+        pass
+    if u is None: return {"prompt_tokens":None,"completion_tokens":None,"total_tokens":None,"finish_reason":finish_reason}
     def g(n):
         try:
             v=getattr(u,n,None); return int(v) if v is not None else None
         except Exception: return None
-    return {"prompt_tokens":g("prompt_tokens"),"completion_tokens":g("completion_tokens"),"total_tokens":g("total_tokens")}
+    return {"prompt_tokens":g("prompt_tokens"),"completion_tokens":g("completion_tokens"),"total_tokens":g("total_tokens"),"finish_reason":finish_reason}
 
 
 def generate_with_fallback_with_usage(question: str, context: str, history: List[Dict[str,str]], force_direct: bool = False) -> tuple[str,str,Dict[str,Optional[int]]]:
@@ -473,21 +630,28 @@ def generate_with_fallback_with_usage(question: str, context: str, history: List
     messages.extend(history[-SESSION_HISTORY_LIMIT:])
     user_content=f"SOURCE DOKUMEN:\n\n{context or '[Tidak ada SOURCE yang relevan]'}\n\nPERTANYAAN:\n{question}\n\nJAWAB:"
     if force_direct:
-        user_content += "\n\nPENTING: Jawab langsung dan sangat ringkas tanpa kalimat pengantar, tanpa proses berpikir, tanpa analisis."
+        user_content += "\n\nPENTING: SOURCE tidak kosong. Periksa ulang semua SOURCE dan jawab berdasarkan fakta yang paling relevan. Jawab langsung dan sangat ringkas tanpa kalimat pengantar, tanpa proses berpikir, tanpa analisis."
     messages.append({"role":"user","content":user_content})
-    providers=[("groq",groq_client,GROQ_CHAT_MODEL),("openrouter",openrouter_client,OPENROUTER_CHAT_MODEL)]
     errors=[]
-    for name,client,model in providers:
-        if client is None:
-            errors.append(f"{name}: not configured"); continue
+    if not llm_clients:
+        raise RuntimeError("No LLM provider is configured")
+    for attempt in range(LLM_PROVIDER_MAX_ATTEMPTS):
+        name, client, model = llm_clients[attempt % len(llm_clients)]
         try:
             response=client.chat.completions.create(model=model,messages=messages,temperature=0.2,max_tokens=MAX_OUTPUT_TOKENS)
             answer=_extract_openai_chat_text(response)
             if not answer: raise RuntimeError(f"{model} returned empty response")
             return answer,name,_usage(response)
         except Exception as exc:
-            errors.append(f"{name}: {exc}"); logger.warning("LLM provider %s failed: %s",name,exc)
-    raise RuntimeError("All LLM providers failed. " + " | ".join(errors))
+            errors.append(f"{name}: {exc}")
+            logger.warning(
+                "LLM provider %s failed on attempt %s/%s; rotating: %s",
+                name, attempt + 1, LLM_PROVIDER_MAX_ATTEMPTS, exc,
+            )
+    raise RuntimeError(
+        f"All LLM providers failed after {LLM_PROVIDER_MAX_ATTEMPTS} attempts. "
+        + " | ".join(errors)
+    )
 
 
 def _strip_chain_of_thought(answer: str) -> str:
@@ -511,6 +675,16 @@ def _clean_answer(answer: str) -> str:
     answer = re.sub(r"[ \t]{2,}", " ", answer)
     answer = re.sub(r"\n{3,}", "\n\n", answer)
     return answer.strip()
+
+
+def _answer_claims_no_information(answer: str) -> bool:
+    normalized = re.sub(r"\s+", " ", answer.lower()).strip(" .!\n")
+    markers = (
+        "informasi tidak ditemukan pada dokumen yang tersedia",
+        "tidak ditemukan pada dokumen yang tersedia",
+        "tidak ada informasi yang ditemukan pada dokumen",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def calculate_evidence_confidence(question: str, docs: List[Dict[str,Any]], answer: str) -> Dict[str,Any]:
@@ -559,6 +733,131 @@ def _fetch_table_rows(table_name: str, limit: int = 1000) -> List[Dict[str, Any]
         raise HTTPException(500, str(parts["error"]))
     return parts["data"] or []
 
+async def hybrid_search(
+    question: str,
+    top_k: int = RAG_TOP_K
+) -> list[dict]:
+
+    embedding = embed_text(question)
+
+    vector_results = []
+
+    try:
+        response = (
+            supabase.rpc(
+                VECTOR_FUNCTION,
+                {
+                    "query_embedding": embedding,
+                    "match_threshold": RAG_MIN_SIMILARITY,
+                    "match_count": top_k
+                }
+            )
+            .execute()
+        )
+
+        vector_results = response.data or []
+
+    except Exception as exc:
+        logger.exception(
+            "Vector search failed: %s",
+            exc
+        )
+
+    keyword_results = []
+
+    try:
+        response = (
+            supabase.rpc(
+                KEYWORD_FUNCTION,
+                {
+                    "search_query": question,
+                    "result_limit": top_k
+                }
+            )
+            .execute()
+        )
+
+        keyword_results = response.data or []
+
+    except Exception as exc:
+        logger.exception(
+            "Keyword search failed: %s",
+            exc
+        )
+
+    exact_results = []
+
+    numbers = re.findall(
+        r"\b\d{3,20}\b",
+        question
+    )
+
+    for number in numbers[:5]:
+
+        try:
+            response = (
+                supabase.rpc(
+                    EXACT_FUNCTION,
+                    {
+                        "search_term": number,
+                        "result_limit": 10
+                    }
+                )
+                .execute()
+            )
+
+            exact_results.extend(
+                response.data or []
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Exact search failed: %s",
+                exc
+            )
+
+    fused = reciprocal_rank_fusion(
+        [
+            exact_results,
+            keyword_results,
+            vector_results
+        ]
+    )
+
+    return fused[:top_k]
+
+def is_structured_question(question: str) -> bool:
+
+    q = question.lower()
+
+    keywords = [
+        "nomor",
+        "no.",
+        "nip",
+        "nisn",
+        "nis",
+        "npsn",
+        "guru",
+        "siswa",
+        "murid",
+        "nama",
+        "kelas",
+        "wali kelas",
+        "mata pelajaran",
+        "mapel",
+        "daftar",
+        "berapa jumlah",
+        "sebutkan",
+        "siapa"
+    ]
+
+    if any(keyword in q for keyword in keywords):
+        return True
+
+    if re.search(r"\b\d{3,20}\b", q):
+        return True
+
+    return False
 
 def _dashboard_activity(rows: List[Dict[str, Any]], label: str, name_key: str) -> List[Dict[str, Any]]:
     activities = []
@@ -735,59 +1034,529 @@ async def embed_upsert_raw(body:EmbedUpsertRequest):
 async def query_docs(body:QueryRequest,authorization:Optional[str]=Header(default=None)):
     role=_authenticated_role(authorization); question=body.question.strip()
     if not question: raise HTTPException(400,"question is required")
-    retrieved = get_similar_documents(embed_text(question), role, RAG_TOP_K)
+    question_embedding = embed_text(question)
+    if role in {"teacher", "admin"}:
+        retrieved = get_similar_documents(question_embedding, role, RAG_TOP_K, question)
+    else:
+        retrieved = get_similar_documents(question_embedding, role, RAG_TOP_K)
     docs=rerank_documents(question,filter_documents_for_role(retrieved, role),RAG_FINAL_K)
     return {"data":_public_sources(docs)}
 
 @app.post("/chat")
-async def chat(body:QueryRequest,authorization:Optional[str]=Header(default=None)):
-    role=_chat_role(authorization)
-    question=body.question.strip()
-    if not question: raise HTTPException(400,"question is required")
+async def chat(
+    body: QueryRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    role = _chat_role(authorization)
+
+    question = body.question.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=400,
+            detail="question is required"
+        )
+
+    # =========================================================
+    # SESSION
+    # =========================================================
+
     persist_session = role != "anonymous"
+
     if persist_session:
         ensure_session(body.session_id)
-    history=get_session_history(body.session_id) if persist_session else []
-    search_query=build_search_query(question,history)
-    if persist_session:
-        save_message(body.session_id,"user",question)
 
-    retrieved = get_similar_documents(embed_text(search_query), role, RAG_TOP_K)
-    docs=rerank_documents(search_query,filter_documents_for_role(retrieved, role),RAG_FINAL_K)
-    context,compression=compress_context(search_query,docs,MAX_CONTEXT_TOKENS)
+    history = (
+        get_session_history(body.session_id)
+        if persist_session
+        else []
+    )
+
+    # =========================================================
+    # QUERY
+    # =========================================================
+
+    search_query = build_search_query(
+        question,
+        history
+    )
+
+    if persist_session:
+        save_message(
+            body.session_id,
+            "user",
+            question
+        )
+
+    # =========================================================
+    # DOCUMENT INVENTORY
+    # =========================================================
+
+    if _is_document_inventory_question(question):
+
+        inventory = filter_documents_for_role(
+            _document_summary(
+                _fetch_document_rows()
+            ),
+            role
+        )
+
+        docs = [
+            {
+                **document,
+                "content": (
+                    f"Dokumen: "
+                    f"{document['pdf_name']}; "
+                    f"jumlah chunk: "
+                    f"{document['chunk_count']}"
+                ),
+                "similarity": 1.0,
+            }
+            for document in inventory
+        ]
+
+        retrieved = docs
+
+        context = "\n".join(
+            document["content"]
+            for document in docs
+        )
+
+        compression = {
+            "original_tokens": estimate_tokens(context),
+            "compressed_tokens": estimate_tokens(context),
+            "compression_ratio": 1.0,
+            "sentences_kept": len(docs),
+            "compressed": False,
+        }
+
+    # =========================================================
+    # NORMAL RAG SEARCH
+    # =========================================================
+
+    else:
+
+        # -----------------------------------------------------
+        # EMBEDDING
+        # -----------------------------------------------------
+
+        search_embedding = embed_text(
+            search_query
+        )
+
+        # -----------------------------------------------------
+        # RETRIEVAL
+        # -----------------------------------------------------
+
+        retrieved = get_similar_documents(
+            search_embedding,
+            role,
+            RAG_TOP_K,
+            search_query
+        )
+
+        # -----------------------------------------------------
+        # ROLE FILTER
+        # -----------------------------------------------------
+
+        accessible_documents = (
+            filter_documents_for_role(
+                retrieved,
+                role
+            )
+        )
+
+        # -----------------------------------------------------
+        # RERANK
+        # -----------------------------------------------------
+
+        docs = rerank_documents(
+            search_query,
+            accessible_documents,
+            RAG_FINAL_K
+        )
+
+        # =====================================================
+        # NO EVIDENCE GUARD
+        # =====================================================
+
+        if not docs:
+
+            logger.warning(
+                "No relevant documents found. "
+                "role=%s question=%s",
+                role,
+                question
+            )
+
+            if persist_session:
+                save_message(
+                    body.session_id,
+                    "assistant",
+                    (
+                        "Maaf, informasi tersebut tidak "
+                        "ditemukan dalam dokumen yang tersedia."
+                    )
+                )
+
+            return {
+                "answer": (
+                    "Maaf, informasi tersebut tidak "
+                    "ditemukan dalam dokumen yang tersedia."
+                ),
+                "session_id": (
+                    body.session_id
+                    if persist_session
+                    else None
+                ),
+                "provider": None,
+                "sources": [],
+                "evidence": {
+                    "confidence": 0.0,
+                    "supported": False,
+                },
+                "retrieval": {
+                    "retrieved_count": len(retrieved),
+                    "final_count": 0,
+                    "min_similarity": RAG_MIN_SIMILARITY,
+                },
+                "token_optimization": {
+                    "enabled": False,
+                    "estimated_input_tokens": 0,
+                    "context_original_tokens": 0,
+                    "context_compressed_tokens": 0,
+                    "compression_ratio": 1.0,
+                    "sentences_kept": 0,
+                    "max_context_tokens": MAX_CONTEXT_TOKENS,
+                    "max_input_tokens": MAX_INPUT_TOKENS,
+                    "max_output_tokens": MAX_OUTPUT_TOKENS,
+                    "provider_usage": None,
+                },
+            }
+
+        # =====================================================
+        # CONTEXT STRATEGY
+        # =====================================================
+
+        structured = is_structured_question(
+            question
+        )
+
+        if structured:
+
+            # =================================================
+            # DATA TERSTRUKTUR
+            # =================================================
+            # Jangan melakukan compression.
+            #
+            # Cocok untuk:
+            # - nama
+            # - NISN
+            # - NIP
+            # - nomor
+            # - daftar guru
+            # - daftar siswa
+            # - kelas
+            # - tabel
+            # =================================================
+
+            context = render_documents_raw(
+                docs
+            )
+
+            compression = {
+                "original_tokens": estimate_tokens(
+                    context
+                ),
+                "compressed_tokens": estimate_tokens(
+                    context
+                ),
+                "compression_ratio": 1.0,
+                "sentences_kept": 0,
+                "compressed": False,
+            }
+
+            logger.info(
+                "Structured question detected. "
+                "Context compression disabled."
+            )
+
+        else:
+
+            # =================================================
+            # NORMAL / NARRATIVE QUESTION
+            # =================================================
+
+            context_budget = min(
+                MAX_CONTEXT_TOKENS,
+                max(
+                    500,
+                    MAX_INPUT_TOKENS
+                    - estimate_tokens(
+                        SYSTEM_PROMPT + search_query
+                    )
+                    - 300,
+                ),
+            )
+
+            if COMPRESS_CONTEXT:
+
+                context, compression = (
+                    compress_context(
+                        search_query,
+                        docs,
+                        context_budget
+                    )
+                )
+
+            else:
+
+                context = render_documents_raw(
+                    docs
+                )
+
+                compression = {
+                    "original_tokens": estimate_tokens(
+                        context
+                    ),
+                    "compressed_tokens": estimate_tokens(
+                        context
+                    ),
+                    "compression_ratio": 1.0,
+                    "sentences_kept": 0,
+                    "compressed": False,
+                }
+
+    # =========================================================
+    # LOG RETRIEVAL
+    # =========================================================
+
+    logger.info(
+        "Chat retrieval "
+        "role=%s "
+        "question=%s "
+        "retrieved=%s "
+        "final=%s "
+        "context_tokens=%s",
+        role,
+        question,
+        len(retrieved),
+        len(docs),
+        compression["compressed_tokens"],
+    )
+
+    # =========================================================
+    # LLM
+    # =========================================================
 
     try:
-        answer,provider,usage=generate_with_fallback_with_usage(question,context,history)
-        answer=_clean_answer(answer)
+
+        answer, provider, usage = (
+            generate_with_fallback_with_usage(
+                question,
+                context,
+                history,
+                force_direct=True,
+            )
+        )
+
+        answer = _clean_answer(
+            answer
+        )
+
+        # =====================================================
+        # EMPTY ANSWER
+        # =====================================================
+
         if not answer:
-            logger.warning("LLM produced only chain-of-thought; retrying with direct-answer instruction")
-            answer,provider,usage=generate_with_fallback_with_usage(question,context,history,force_direct=True)
-            answer=_clean_answer(answer)
+
+            logger.warning(
+                "LLM returned empty answer. "
+                "Retrying."
+            )
+
+            retry_answer, retry_provider, retry_usage = (
+                generate_with_fallback_with_usage(
+                    question,
+                    context,
+                    history,
+                    force_direct=True,
+                )
+            )
+
+            retry_answer = _clean_answer(
+                retry_answer
+            )
+
+            if retry_answer:
+
+                answer = retry_answer
+                provider = retry_provider
+                usage = retry_usage
+
+        # =====================================================
+        # NO INFORMATION ANSWER
+        # =====================================================
+
+        elif (
+            docs
+            and _answer_claims_no_information(
+                answer
+            )
+        ):
+
+            logger.warning(
+                "LLM claimed no information "
+                "despite available source. "
+                "Retrying."
+            )
+
+            retry_answer, retry_provider, retry_usage = (
+                generate_with_fallback_with_usage(
+                    question,
+                    context,
+                    history,
+                    force_direct=True,
+                )
+            )
+
+            retry_answer = _clean_answer(
+                retry_answer
+            )
+
+            if (
+                retry_answer
+                and not _answer_claims_no_information(
+                    retry_answer
+                )
+            ):
+
+                answer = retry_answer
+                provider = retry_provider
+                usage = retry_usage
+
     except Exception as exc:
-        raise HTTPException(502,f"All LLM providers failed: {exc}")
+
+        logger.exception(
+            "All LLM providers failed"
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"All LLM providers failed: {exc}"
+        )
+
+    # =========================================================
+    # SAVE ASSISTANT MESSAGE
+    # =========================================================
 
     if persist_session:
-        save_message(body.session_id,"assistant",answer)
-    prompt_estimate=estimate_tokens(SYSTEM_PROMPT+"\n"+context+"\n"+question)
-    evidence=calculate_evidence_confidence(question,docs,answer)
+
+        save_message(
+            body.session_id,
+            "assistant",
+            answer
+        )
+
+    # =========================================================
+    # EVIDENCE
+    # =========================================================
+
+    prompt_estimate = estimate_tokens(
+        SYSTEM_PROMPT
+        + "\n"
+        + context
+        + "\n"
+        + question
+    )
+
+    evidence = calculate_evidence_confidence(
+        question,
+        docs,
+        answer
+    )
+
+    # =========================================================
+    # RESPONSE
+    # =========================================================
 
     return {
-        "answer":answer,
-        "session_id":body.session_id if persist_session else None,
-        "provider":provider,
-        "sources":_public_sources(docs),
-        "evidence":evidence,
-        "retrieval":{"retrieved_count":len(docs),"final_count":len(docs),"min_similarity":RAG_MIN_SIMILARITY},
-        "token_optimization":{
-            "enabled":COMPRESS_CONTEXT,
-            "estimated_input_tokens":prompt_estimate,
-            "context_original_tokens":compression["original_tokens"],
-            "context_compressed_tokens":compression["compressed_tokens"],
-            "compression_ratio":compression["compression_ratio"],
-            "sentences_kept":compression["sentences_kept"],
-            "max_context_tokens":MAX_CONTEXT_TOKENS,
-            "max_input_tokens":MAX_INPUT_TOKENS,
-            "max_output_tokens":MAX_OUTPUT_TOKENS,
-            "provider_usage":usage,
+        "answer": answer,
+
+        "session_id": (
+            body.session_id
+            if persist_session
+            else None
+        ),
+
+        "provider": provider,
+
+        "sources": _public_sources(
+            docs
+        ),
+
+        "evidence": evidence,
+
+        "retrieval": {
+            "retrieved_count": len(retrieved),
+            "final_count": len(docs),
+            "min_similarity": RAG_MIN_SIMILARITY,
+            "structured_question": (
+                is_structured_question(
+                    question
+                )
+            ),
+        },
+
+        "token_optimization": {
+
+            "enabled": (
+                COMPRESS_CONTEXT
+                and not is_structured_question(
+                    question
+                )
+            ),
+
+            "estimated_input_tokens": (
+                prompt_estimate
+            ),
+
+            "context_original_tokens": (
+                compression[
+                    "original_tokens"
+                ]
+            ),
+
+            "context_compressed_tokens": (
+                compression[
+                    "compressed_tokens"
+                ]
+            ),
+
+            "compression_ratio": (
+                compression[
+                    "compression_ratio"
+                ]
+            ),
+
+            "sentences_kept": (
+                compression[
+                    "sentences_kept"
+                ]
+            ),
+
+            "max_context_tokens": (
+                MAX_CONTEXT_TOKENS
+            ),
+
+            "max_input_tokens": (
+                MAX_INPUT_TOKENS
+            ),
+
+            "max_output_tokens": (
+                MAX_OUTPUT_TOKENS
+            ),
+
+            "provider_usage": usage,
         },
     }

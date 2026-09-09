@@ -40,6 +40,17 @@ class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
         answer = "<reasoning>Panjang</reasoning>Jawaban langsung."
         self.assertEqual(app._clean_answer(answer), "Jawaban langsung.")
 
+    def test_no_information_answer_is_detected(self):
+        self.assertTrue(app._answer_claims_no_information("Informasi tidak ditemukan pada dokumen yang tersedia."))
+        self.assertFalse(app._answer_claims_no_information("Nama kepala sekolah adalah Rosihan Anwar."))
+
+    def test_long_document_is_split_before_context_compression(self):
+        text = ("Informasi umum sekolah. " * 80) + "Nama kepala sekolah adalah Rosihan Anwar."
+        segments = app._sentences(text)
+
+        self.assertGreater(len(segments), 1)
+        self.assertIn("Rosihan Anwar", segments[-1])
+
     async def _chat_with_answer(self, answer, docs=None, role="user"):
         docs = docs or [{"pdf_name": "Laporan.pdf", "content": "Isi dokumen"}]
         with patch.object(app, "_authenticated_role", return_value=role), \
@@ -102,7 +113,7 @@ class ChatEndpointTests(unittest.IsolatedAsyncioTestCase):
             response = await app.chat(app.QueryRequest(question="Pertanyaan", session_id="anonymous-session"))
 
         self.assertEqual(response["sources"], [{"pdf_name": "Public.pdf", "content": "Publik", "category": "public"}])
-        search.assert_called_once_with([0.1], "anonymous", app.RAG_TOP_K)
+        search.assert_called_once_with([0.1], "anonymous", app.RAG_TOP_K, "Pertanyaan")
         ensure.assert_not_called()
         save.assert_not_called()
 
